@@ -26,7 +26,8 @@
  *    会话日志，指挥不必再去各窗口确认"卡到底收到没"。
  * 4. **不误伤长对话**：**不做深度限流**。指挥↔窗口本就该长期往返（发卡→回执→再发卡
  *    →回报），任何"接力链深度上限"都会在第 3 轮把正常流程拦死。环路安全改由一条更强的
- *    不变量保证：**回执永不触发回执**；另有一条"自最近真人消息起连续跳数"的失控保护，
+ *    不变量保证：**回执永不触发回执**（回执只写本地、不发给任何人，故由构造保证）；
+ *    另有一条"自最近真人消息起、本会话收到多少条转达"的失控保护，
  *    见 {@link MAX_AGENT_HOPS}。
  *
  * ── 复用而非新造 ────────────────────────────────────────────────────────
@@ -59,7 +60,8 @@
  *   2. 越权：目标为子代理会话时 `resolveAgent()` 返回错误，本插件原样上抛。
  *   3. 自环：拒绝向自己发送。
  *   4. 角色归属：角色只在**注册它的那个工作区**内可解析，不会被别的工作区借用。
- *   5. 回执不触发回执（唯一的绝对环路保证）。
+ *   5. 回执不触发回执（由构造保证：回执只写本地日志，不投递给任何人）。
+ *   6. 单方广播（指挥连派多张卡）不计入失控保护——保护只看**收到**多少条转达。
  *
  * 本插件只读写一个角色名册文件（`$DSH_HOME/session-relay/roles.json`）；
  * 不读环境变量、不发网络请求、不改任何既有工具的行为。
@@ -922,9 +924,15 @@ async function deliverMessage(services, exec, spec) {
     )
   }
 
-  // 回执永不触发回执：这是本插件唯一的绝对环路不变量。
-  const itselfIsReceipt = relay.fromReceipt
-  const wantReceipt = !itselfIsReceipt && expectReceipt
+  // 回执永不触发回执 —— **由构造保证，无需代码抑制**。
+  //
+  // 回执只经 `caller.inject()` 写进**发送方自己的**会话日志（不唤醒、不产生新轮次），
+  // 从不作为消息投递给任何人。收件方根本收不到回执，因此不存在"回执引发回执"的路径。
+  //
+  // 早先这里用「日志里最新一条自家消息是不是回执」来抑制后续回执，那是**错的**：
+  // 回执是写在发送方本地的记录，于是指挥**连派第二张卡时**就会被误判成"在响应回执"，
+  // 静默地不再写回执——多卡派工（本工作流的常态）从第二张起全部没有回执。
+  const wantReceipt = expectReceipt
 
   // 子代理会话不得绕过父代理直接跨会话投递：仓库的既定原则是"子代理会话归
   // subagent 路由所有"（见 hasApiSessionSubagentOwner），其对外沟通应当走
@@ -1180,31 +1188,35 @@ function createReceiptMessage(target, targetRole, summary) {
 }
 
 /**
- * 读取调用方的"转达状态"，一次扫描回答两个问题：
- *   - `fromReceipt`：日志里最后一条 user 消息是否是一条**运行时回执**（回执永不触发回执）；
- *   - `agentHops`：自最近一条**真人消息**以来，连续的 agent 之间消息条数（含回执）。
+ * 读取调用方的"转达状态"：自最近一条**真人消息**以来，收到过多少条**转达消息**。
+ *
+ * 口径说明（两个反直觉但重要的选择）：
+ *
+ * 1. **只数 `session-relay`（别人发给我的转达），不数 `session-relay-receipt`（本地回执）。**
+ *    回执是插件写进发送方自己日志的记账，不是任何一方的发言、也不发给任何人。
+ *    若把回执也计入，**指挥连派 17 张卡就会被误拦**——而单方广播恰恰是本工作流的常态
+ *    （指挥拆卡往外发，各窗口各干各的，根本没有往复）。
+ *
+ * 2. 因此计的是**收件量**，不是发包量。指挥派 100 张卡：自己的日志里 0 条转达 ⇒ 不会被拦。
+ *    而 A↔B 互相来回：每轮各自 +1 条 ⇒ 有限步内被掐断。这正是要防的那种"无人看着的空转"。
+ *
  * @param agent - 调用方 Agent。
- * @returns 转达状态；日志读不到时保守返回"非回执、0 跳"。
+ * @returns `{ agentHops }`；日志读不到时保守返回 0（宁可少拦一次，也不误拦正常协作）。
  */
 function relayState(agent) {
-  const fallback = { fromReceipt: false, agentHops: 0 }
   try {
     const events = agent?.session?.snapshotEvents?.() ?? []
-    let fromReceipt
     let hops = 0
     for (let index = events.length - 1; index >= 0; index--) {
       const event = events[index]
       if (event?.type !== 'user/message') continue
       const kind = event.data?.source?.kind
       if (kind === 'user') break // 真人输入：预算到此重置。
-      if (!OWN_KINDS.has(kind)) continue
-      fromReceipt ??= kind === RECEIPT_SOURCE_KIND
-      hops += 1
+      if (kind === RELAY_SOURCE_KIND) hops += 1
     }
-    return { fromReceipt: fromReceipt === true, agentHops: hops }
+    return { agentHops: hops }
   } catch {
-    // 读不到日志就按"不是回执、不计数"处理：宁可少拦一次，也不要误拦正常协作。
-    return fallback
+    return { agentHops: 0 }
   }
 }
 

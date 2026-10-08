@@ -23,3 +23,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 派工卡工作目录（一次性测试/协作产物，不进源码仓库）
+_ops/

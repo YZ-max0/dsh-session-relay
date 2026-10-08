@@ -290,21 +290,57 @@ describe('send_session_message — automatic receipts', () => {
     assert.equal(receiptsWrittenTo(commander).length, 1)
   })
 
-  test('a receipt never triggers another receipt (the anti-ping-pong invariant)', async () => {
-    // This is the plugin's one absolute loop guarantee. A session whose latest user
-    // message is a receipt may still send, but must not generate a new receipt.
-    const conversation = [
-      { type: 'user/message', data: { source: { kind: 'session-relay-receipt', form: 'notice' } } },
-    ]
-    const sender = makeAgent({ id: 'session-commander', cwd: WORKSPACE, events: conversation })
-    const target = makeAgent({ id: 'session-target', cwd: WORKSPACE })
-    const host = makeContext({ agents: [sender, target] })
-    plugin.apply(host.ctx, { rolesFile })
+  test('a receipt is never delivered to anyone (so it cannot trigger a reply)', async () => {
+    // "Receipts never trigger receipts" is guaranteed by construction, not by suppressing
+    // later receipts: a receipt only ever goes into the SENDER's own log via `inject`, so
+    // no session ever receives one and there is no path for a receipt to prompt a reply.
+    //
+    // This test pins the construction. An earlier implementation instead suppressed the
+    // receipt whenever the sender's newest own message was a receipt — which silently
+    // killed the receipt for the 2nd, 3rd, … card of a multi-card dispatch.
+    const { tools, commander, workerAgents } = hostWith()
+    await callTool(tools, 'send_session_message', { to: 'session-worker-0', message: 'x' }, { agent: commander })
+    const receipt = receiptsWrittenTo(commander)[0]
+    assert.ok(receipt !== undefined)
 
-    const value = await callTool(host.tools, 'send_session_message', { to: 'session-target', message: 'ok' }, { agent: sender })
-    assert.equal(value.delivered, true)
-    assert.equal(value.receiptWritten, false)
-    assert.equal(receiptsWrittenTo(sender).length, 0)
+    // The recipient saw the relay message only — never the receipt.
+    const workerInbox = messagesDeliveredTo(workerAgents[0].agent)
+    assert.equal(workerInbox.length, 1)
+    assert.equal(workerInbox[0].source.kind, 'session-relay')
+    assert.ok(workerInbox.every(message => message.source.kind !== 'session-relay-receipt'))
+  })
+
+  test('consecutive dispatches each get their own receipt', async () => {
+    // The multi-card case that the old suppression broke: a commander dispatching several
+    // cards in a row (the normal workflow) must keep getting a receipt for every one.
+    const { tools, commander, workerAgents } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })
+    for (let index = 1; index <= 5; index += 1) {
+      const value = await callTool(
+        tools, 'dispatch_card',
+        { card_path: `cards/派工单-${index}（后端窗口）.md` },
+        { agent: commander },
+      )
+      assert.equal(value.receiptWritten, true, `card ${index} should get a receipt`)
+    }
+    assert.equal(receiptsWrittenTo(commander).length, 5)
+    assert.equal(messagesDeliveredTo(workerAgents[0].agent).length, 5)
+  })
+
+  test('a one-way broadcast is not treated as a runaway loop', async () => {
+    // Dispatching many cards is one-way work: the commander receives no relay messages at
+    // all, so the runaway guard (which counts RECEIVED relays) must never fire.
+    const { tools, commander, workerAgents } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })
+    for (let index = 1; index <= 40; index += 1) {
+      const outcome = await tryTool(
+        tools, 'dispatch_card',
+        { card_path: `cards/派工单-${index}（后端窗口）.md` },
+        { agent: commander },
+      )
+      assert.equal(outcome.ok, true, `dispatch ${index} should be allowed`)
+    }
+    assert.equal(receiptsWrittenTo(commander).length, 40)
   })
 
   test('expect_receipt: false suppresses the receipt on request', async () => {
@@ -320,14 +356,28 @@ describe('send_session_message — automatic receipts', () => {
 })
 
 describe('runaway protection', () => {
-  const hop = kind => ({ type: 'user/message', data: { source: { kind, form: 'relay' } } })
+  /** One relay message received from another session. */
+  const receivedRelay = () => ({
+    type: 'user/message',
+    data: { source: { kind: 'session-relay', form: 'relay', senderSessionId: 'session-peer' } },
+  })
 
-  /** Build a sender carrying `count` consecutive agent-to-agent messages. */
+  /** One locally-written receipt (never delivered, so it must not count). */
+  const localReceipt = () => ({
+    type: 'user/message',
+    data: { source: { kind: 'session-relay-receipt', form: 'notice' } },
+  })
+
+  /**
+   * A sender whose log carries `count` received relays, plus any trailing events.
+   *
+   * The guard counts what this session **received** from other sessions, because that is
+   * what an unattended A↔B loop produces. A one-way broadcaster (a commander dispatching
+   * many cards) receives none, so it is never throttled.
+   */
   function senderWithHops(count, trailing = []) {
     const events = []
-    for (let index = 0; index < count; index += 1) {
-      events.push(hop(index % 2 === 0 ? 'session-relay' : 'session-relay-receipt'))
-    }
+    for (let index = 0; index < count; index += 1) events.push(receivedRelay())
     events.push(...trailing)
     return makeAgent({ id: 'session-sender', cwd: WORKSPACE, events })
   }
@@ -352,6 +402,27 @@ describe('runaway protection', () => {
       const outcome = await attempt(hops)
       assert.equal(outcome.ok, false, `hops=${hops} should be blocked`)
       assert.match(outcome.error, /consecutive session-to-session messages/)
+    }
+  })
+
+  test('locally-written receipts do NOT count toward the budget', async () => {
+    // A receipt is the plugin's own bookkeeping in the sender's log, not something another
+    // session said. Counting it would throttle a commander after ~16 cards dispatched —
+    // the normal workflow — which is exactly the bug this asserts against.
+    const outcome = await attempt(0, Array.from({ length: 40 }, localReceipt))
+    assert.equal(outcome.ok, true)
+  })
+
+  test('a one-way broadcast never trips the guard, however many cards are sent', async () => {
+    const { tools, commander, workerAgents } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })
+    for (let index = 1; index <= 30; index += 1) {
+      const outcome = await tryTool(
+        tools, 'dispatch_card',
+        { card_path: `cards/派工单-${index}（后端窗口）.md` },
+        { agent: commander },
+      )
+      assert.equal(outcome.ok, true, `card ${index} should be allowed`)
     }
   })
 
