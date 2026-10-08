@@ -354,8 +354,12 @@ const sendTool = {
         type: 'string',
         enum: ['queue', 'steer'],
         description:
-          'queue (default) starts a fresh turn for the target, so it begins work immediately; steer '
-          + 'delivers at the target\'s nearest step boundary instead.',
+          'queue (default) gives the message its own new turn for the target — right for handing over '
+          + 'a dispatch card ("go do this now"). steer delivers at the target\'s next step boundary, '
+          + 'where ALL steered messages enter context together in one step — right for reports, since '
+          + 'with queue several windows reporting to one coordinator are admitted only one per turn '
+          + '(measured: up to 65.8 minutes for the last one). steer does NOT interrupt work in '
+          + 'progress; the target picks it up at its next step boundary.',
       },
       expect_receipt: {
         type: 'boolean',
@@ -431,11 +435,16 @@ const dispatchTool = {
           'Optional extra instruction to accompany the card (for example "按卡执行" or a specific '
           + 'correction). Keep it short — the card file itself is the authoritative task description.',
       },
-      mode: {
-        type: 'string',
-        enum: ['queue', 'steer'],
-        description: 'queue (default) starts a fresh turn for the target immediately; steer interrupts it at its next step.',
-      },
+        mode: {
+          type: 'string',
+          enum: ['queue', 'steer'],
+          description:
+            'queue (default) gives the card its own new turn for the target — right here, because a '
+            + 'dispatch should start a dedicated turn. steer delivers at the next step boundary, where '
+            + 'all steered messages enter context together in one step — prefer it when the same '
+            + 'message goes to several recipients and you want them to be seen together. steer does '
+            + 'not interrupt work in progress.',
+        },
       expect_receipt: {
         type: 'boolean',
         description: 'Whether to write a runtime delivery receipt into your own transcript (default true).',
@@ -1148,11 +1157,24 @@ function createRelayMessage(services, caller, options) {
   // 卡被转发/转派后就不再成立。实测踩过：同一张卡被两个不同会话派发时，
   // 收件方拿到两个互相矛盾的回信地址，不知该听谁的。
   const replyTarget = JSON.stringify(callerRole ?? callerId)
-  const reply = `send_session_message({ to: ${replyTarget}, ... })`
   blocks.push(
     '── 回信方式 ──',
-    `收到后请先回一句「已收卡」（用 ${reply}），让我知道卡已经到你手上；`,
-    '干完后把回报也发回同一个地址。回复是可选的，但本工作区的既有约定是「开工前先回报一句」。',
+    // 刻意**不要求**收件方先回一句「已收卡」：插件在投递成功时已经自动写了一条
+    // `form: 'notice'` 的运行时回执给发送方（见 createReceiptMessage）。再让收件方
+    // 手工回一句，是**同一信息的第二份**。实测代价：一次 15 条的验证里，「已收卡」类
+    // 占了 8 条（53%），而 P0 下每一条都要独占一个队列位、推迟真正的回报。
+    `干完后把**结果**回报到 ${replyTarget}——**回报请带 mode（见下）**。`,
+    `**不必**先回「已收卡」：投递成功时本插件已自动给你回执，再手工回一句是重复信息，`,
+    '而每条重复消息都会独占收件方的一个队列位、推迟真正的回报。',
+    '',
+    '🔴 **回报请加 `mode: "steer"`**：',
+    `    send_session_message({ to: ${replyTarget}, message: "…回报…", mode: "steer" })`,
+    '原因：多条回报投给同一个会话时，默认的 `queue` 是**一轮只进一条**（DSH 的 `next-turn`',
+    '语义），N 个窗口回报就要 N 轮，实测最慢 65.8 分钟才收到；`steer`（`next-step`）会让',
+    '**多条在同一步一次性进入对方上下文**。`steer` 不会打断对方正在做的事——它只在对方',
+    '下一个 step 边界被取走。',
+    '',
+    `（若这张卡需要中途同步进度，同样用上述写法；只是想打个招呼就不必发。）`,
     '',
     `🔴 **回信地址以本块为准**：${replyTarget} 就是**把这张卡派给你的那个会话**。`,
     '若卡片正文里写了别的收件人，那是卡作者原来的假设——卡可能被转派，所以以本块为准。',

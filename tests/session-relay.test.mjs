@@ -21,6 +21,7 @@ import {
   tryTool,
   messagesDeliveredTo,
   receiptsWrittenTo,
+  deliveriesOf,
 } from './helpers.mjs'
 
 const WORKSPACE = '/workspace/project'
@@ -201,12 +202,20 @@ describe('send_session_message — happy paths', () => {
   })
 
   test('queue uses followup (immediate new turn), steer uses steer', async () => {
+    // This assertion matters more than it looks: the plugin now TELLS recipients to send
+    // reports with mode "steer" precisely because steer admits multiple messages in ONE step
+    // while followup admits one per turn. If the two ever collapsed onto the same mechanism,
+    // that advice would become a lie — and the measured 65.8-minute report latency would
+    // quietly return. Pin the mechanism, not just the message count.
     const { tools, commander, workerAgents } = hostWith()
     await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })
     await callTool(tools, 'send_session_message', { to: '后端窗口', message: 'a' }, { agent: commander })
     await callTool(tools, 'send_session_message', { to: '后端窗口', message: 'b', mode: 'steer' }, { agent: commander })
-    const kinds = workerAgents[0].agent.session && messagesDeliveredTo(workerAgents[0].agent)
-    assert.equal(kinds.length, 2)
+
+    assert.deepEqual(
+      deliveriesOf(workerAgents[0].agent).map(entry => entry.kind),
+      ['followup', 'steer'],
+    )
   })
 
   test('delivers by exact session id', async () => {
@@ -737,7 +746,34 @@ describe('dispatch_card', () => {
     const text = messagesDeliveredTo(worker)[0].content.map(part => part.text).join('\n')
     assert.match(text, /回信地址以本块为准/)
     // The commander dispatched it and has no registered role, so its session id is the address.
-    assert.match(text, /send_session_message\(\{ to: "session-commander", \.\.\. \}\)/)
+    assert.match(text, /"session-commander"/)
+  })
+
+  test('the reply block does not ask for a redundant "已收卡" acknowledgement', async () => {
+    // The plugin already writes a delivery receipt into the sender's own log on success
+    // (form: 'notice'). Asking the recipient to ALSO手写一句「已收卡」duplicates that fact,
+    // and under next-turn queuing every duplicate occupies its own queue slot: in a measured
+    // 15-message run, 8 (53%) were such noise, pushing the real reports back by 8 turns.
+    const { tools, commander, workerAgents } = hostWith()
+    const worker = workerAgents[0].agent
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: worker })
+    await callTool(tools, 'dispatch_card', { card_path: 'x-派工单-y（后端窗口）.md' }, { agent: commander })
+
+    const text = messagesDeliveredTo(worker)[0].content.map(part => part.text).join('\n')
+    assert.match(text, /不必\*\*先回「已收卡」/)
+    assert.ok(!/收到后请先回一句/.test(text), 'must not ask for the redundant acknowledgement')
+  })
+
+  test('the reply block tells the recipient to send reports with mode: "steer"', async () => {
+    // queue admits one message per turn; steer admits all steered messages in a single step.
+    // Reports fan IN to one coordinator, so queue is exactly the wrong mode for them.
+    const { tools, commander, workerAgents } = hostWith()
+    const worker = workerAgents[0].agent
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: worker })
+    await callTool(tools, 'dispatch_card', { card_path: 'x-派工单-y（后端窗口）.md' }, { agent: commander })
+
+    const text = messagesDeliveredTo(worker)[0].content.map(part => part.text).join('\n')
+    assert.match(text, /mode: "steer"/)
   })
 
   test('the reply block follows the dispatcher when two sessions send the same card', async () => {
