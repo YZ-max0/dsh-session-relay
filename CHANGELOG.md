@@ -53,6 +53,14 @@
   （`defineTool` 的写法，DSH 的 schema 校验会拒绝），并加入静态检查防止复发。
 - 四个工具的 `parameters` 全部补上 `additionalProperties: false`，
   使模型拼错参数名时得到明确的拒绝，而不是被静默忽略。
+- **修正 Node 20 下测试无法运行**：原先 `npm test` 写成
+  `node --test "tests/**/*.test.mjs"`，而 **Node 20 的 test runner 不展开被引号包住的
+  glob**（Node 22 才展开），在 CI 的 node 20 上直接报
+  `Could not find '…/tests/**/*.test.mjs'` 并以退出码 1 结束。
+  改用不带参数的 `node --test`（自动发现测试），在 Node 20 与 22 上均验证通过，
+  且实测**不会**把 `node_modules` 里的文件当成测试扫进来。
+  注：`node --test tests`（目录形式）在 22 上会报 `Cannot find module …/tests`，
+  同样不可移植，故未采用。
 
 [Unreleased]: https://github.com/YZ-max0/dsh-session-relay/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/YZ-max0/dsh-session-relay/releases/tag/v0.1.0
