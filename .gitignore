@@ -1,0 +1,25 @@
+# Dependencies (this project has none at runtime, but keep the file honest)
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# DSH runtime state written by the plugin's role registry during local testing
+.dsh/
+roles.json
+
+# Local, machine-specific install artifacts
+*.bak
+*.bak-*
+cordis.patch.yml.bak*
+
+# Private working notes: real project names, card ids, internal paths.
+# Never publish this directory.
+.private/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

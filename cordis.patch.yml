@@ -1,0 +1,18 @@
+# dsh-session-relay — DSH bundle patch.
+#
+# Mounts the plugin when this package is installed as a DSH bundle:
+#
+#     dsh plugin --profile web add github:YZ-max0/dsh-session-relay
+#
+# The `name` below is a bare package specifier, so it resolves through the
+# profile's node_modules — the normal bundle path. For a *local checkout*
+# without installing the package, reference the file by absolute path instead:
+#
+#     - insert:
+#         - id: session-relay
+#           name: '/absolute/path/to/session-relay.mjs'
+#
+# and run `python3 install.py` (see README) to write that row for you.
+- insert:
+    - id: session-relay
+      name: 'dsh-session-relay'

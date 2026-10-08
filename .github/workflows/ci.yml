@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# The project has zero runtime dependencies and its tests use only Node's built-in
+# test runner, so CI needs no install step and no network beyond checking out the repo.
+# That is deliberate: a dependency-free suite cannot break because an upstream
+# `@deepseek-ai/*` package published a new version.
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the floor declared in package.json engines; 22 is what DSH ships today.
+        node: ['20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check
+        run: node --check session-relay.mjs
+
+      - name: Manifest and schema checks
+        run: node scripts/check-manifest.mjs
+
+      - name: Unit tests
+        # No `npm install`: there is nothing to install. DSH is absent, so the
+        # integration tests skip themselves and the suite stays green.
+        run: npm test
+
+  integration:
+    name: integration (real DSH)
+    runs-on: ubuntu-latest
+    # Informational: the integration suite needs a full DSH installation, which is not
+    # published for every commit of the harness. Failure here should not block a PR,
+    # because the unit suite already pins the plugin's own behaviour.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Try to install DSH packages
+        run: |
+          npm install --no-save \
+            @deepseek-ai/cordis \
+            @deepseek-ai/dsh-tools \
+            @deepseek-ai/dsh-session \
+            @deepseek-ai/dsh-system-prompt || {
+              echo "::warning::could not install DSH packages; integration tests will skip"
+              exit 0
+            }
+
+      - name: Integration tests
+        run: DSH_MODULE_ROOT="$PWD" npm test
+
+  lint:
+    name: whitespace and file hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No trailing whitespace in tracked text files
+        run: |
+          failed=0
+          while IFS= read -r file; do
+            case "$file" in
+              *.png|*.jpg|*.gif|LICENSE) continue ;;
+            esac
+            if grep -nE ' +$' "$file" >/dev/null 2>&1; then
+              echo "::error file=$file::trailing whitespace"
+              grep -nE ' +$' "$file" | head -5
+              failed=1
+            fi
+          done < <(git ls-files)
+          exit $failed
+
+      - name: Every file ends with a newline
+        run: |
+          failed=0
+          while IFS= read -r file; do
+            case "$file" in
+              *.png|*.jpg|*.gif) continue ;;
+            esac
+            [ -s "$file" ] || continue
+            if [ "$(tail -c 1 "$file" | wc -l)" -eq 0 ]; then
+              echo "::error file=$file::missing final newline"
+              failed=1
+            fi
+          done < <(git ls-files)
+          exit $failed
+
+      - name: Private working notes must not be tracked
+        # `.private/` holds real project names and internal paths; it must never ship.
+        run: |
+          if git ls-files --error-unmatch '.private/*' >/dev/null 2>&1; then
+            echo "::error::files under .private/ are tracked; they must stay local"
+            git ls-files '.private/*'
+            exit 1
+          fi
+          echo "no private notes are tracked"

@@ -1,0 +1,54 @@
+{
+  "name": "dsh-session-relay",
+  "version": "0.1.0",
+  "description": "Cross-session messaging for DSH: dispatch task cards to other sessions in the same workspace and get reports back, with stable role addressing, automatic delivery receipts and runaway-loop protection.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "cordis-plugin",
+    "agent",
+    "multi-agent",
+    "session",
+    "orchestration",
+    "handoff"
+  ],
+  "license": "MIT",
+  "author": "YZ-max0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YZ-max0/dsh-session-relay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YZ-max0/dsh-session-relay/issues"
+  },
+  "homepage": "https://github.com/YZ-max0/dsh-session-relay#readme",
+  "type": "module",
+  "main": "session-relay.mjs",
+  "exports": {
+    ".": "./session-relay.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "session-relay.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "test:watch": "node --test --watch \"tests/**/*.test.mjs\"",
+    "check": "node --check session-relay.mjs && node scripts/check-manifest.mjs"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.0"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
