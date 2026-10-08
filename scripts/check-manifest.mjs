@@ -308,6 +308,49 @@ for (const relative of trackedFiles()) {
 }
 pass(`no private identifiers in ${scanned} tracked text files`)
 
+/* ------------------------------------------------- 6. documented test counts are current */
+
+/**
+ * Keep "N 个测试" claims in the docs honest.
+ *
+ * Why this check exists: I wrote a stale test count into the README **three times**
+ * (83, then 78, then 98 — while the suite had grown to 100). Nothing caught it, because a
+ * wrong number in prose looks exactly like a right one. It only surfaces when a reader
+ * trusts it and is misled.
+ *
+ * The fix is not discipline, it is automation: read the real count from the test runner
+ * and compare it against every documented claim.
+ */
+try {
+  const output = execFileSync(process.execPath, ['--test'], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  })
+  const actual = /^# tests (\d+)$/m.exec(output)?.[1]
+  if (actual === undefined) {
+    fail('could not read the test count from `node --test` output')
+  } else {
+    const CLAIM = /(\d+)\s*个测试/g
+    let claims = 0
+    for (const relative of trackedFiles()) {
+      if (!relative.endsWith('.md')) continue
+      const text = readFileSync(join(root, relative), 'utf8')
+      for (const match of text.matchAll(CLAIM)) {
+        claims += 1
+        if (match[1] !== actual) {
+          fail(`${relative}: says "${match[0]}" but the suite has ${actual} tests`)
+        }
+      }
+    }
+    // A claim that vanished entirely is also a drift signal, but a soft one.
+    if (claims === 0) notes.push('no documented test count to verify')
+    else pass(`documented test count matches the suite (${actual})`)
+  }
+} catch (error) {
+  fail(`could not run the test suite to verify documented counts: ${error.message}`)
+}
+
 /* ---------------------------------------------------------------------- report */
 
 for (const note of notes) console.log(`  ok   ${note}`)
