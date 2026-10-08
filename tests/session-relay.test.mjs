@@ -356,10 +356,13 @@ describe('send_session_message — automatic receipts', () => {
 })
 
 describe('runaway protection', () => {
-  /** One relay message received from another session. */
-  const receivedRelay = () => ({
+  /**
+   * One relay message received from another session.
+   * @param sender - sender session id; the guard keys on this, so it matters.
+   */
+  const receivedRelay = (sender = 'session-peer') => ({
     type: 'user/message',
-    data: { source: { kind: 'session-relay', form: 'relay', senderSessionId: 'session-peer' } },
+    data: { source: { kind: 'session-relay', form: 'relay', senderSessionId: sender } },
   })
 
   /** One locally-written receipt (never delivered, so it must not count). */
@@ -375,9 +378,9 @@ describe('runaway protection', () => {
    * what an unattended A↔B loop produces. A one-way broadcaster (a commander dispatching
    * many cards) receives none, so it is never throttled.
    */
-  function senderWithHops(count, trailing = []) {
+  function senderWithHops(count, trailing = [], sender = 'session-peer') {
     const events = []
-    for (let index = 0; index < count; index += 1) events.push(receivedRelay())
+    for (let index = 0; index < count; index += 1) events.push(receivedRelay(sender))
     events.push(...trailing)
     return makeAgent({ id: 'session-sender', cwd: WORKSPACE, events })
   }
@@ -424,6 +427,39 @@ describe('runaway protection', () => {
       )
       assert.equal(outcome.ok, true, `card ${index} should be allowed`)
     }
+  })
+
+  test('a fan-in from many distinct windows is NOT a loop (regression)', async () => {
+    // The coordinator's most ordinary situation: N windows each report once. Every message
+    // arrives from a DIFFERENT session, so there is no ping-pong to break.
+    //
+    // Counting the raw total got this wrong: a coordinator that had merely *heard from*
+    // 16 windows in a row was silenced — it could not even say "收到" back, until a human
+    // happened to speak. Real run: a 4-window verification accumulated 14 inbound relays
+    // and was heading for the limit with nothing wrong.
+    const { tools, commander } = hostWith()
+    const events = []
+    for (let index = 0; index < 25; index += 1) events.push(receivedRelay(`session-window-${index}`))
+    const busy = makeAgent({ id: 'session-busy', cwd: WORKSPACE, events })
+    const peer = makeAgent({ id: 'session-peer', cwd: WORKSPACE })
+    const host = makeContext({ agents: [busy, peer] })
+    plugin.apply(host.ctx, { rolesFile })
+    await callTool(host.tools, 'register_session_role', { role: '协调窗口' }, { agent: busy })
+    await callTool(host.tools, 'register_session_role', { role: '对端窗口' }, { agent: peer })
+
+    const outcome = await tryTool(
+      host.tools, 'send_session_message',
+      { to: '对端窗口', message: '收到' },
+      { agent: busy },
+    )
+    assert.equal(outcome.ok, true, 'hearing from many distinct windows must not silence the coordinator')
+  })
+
+  test('a ping-pong with ONE peer still trips the guard', async () => {
+    // The case the guard exists for: two sessions trading messages indefinitely.
+    const outcome = await attempt(16, [], 'session-same-peer')
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /consecutive session-to-session messages/)
   })
 
   test('a human message resets the budget, so long collaborations keep working', async () => {
