@@ -719,6 +719,155 @@ describe('dispatch_card', () => {
   })
 })
 
+/**
+ * The report-direction asymmetry.
+ *
+ * A dispatch card's trailing bracket names the RECIPIENT; a report's names who WROTE it.
+ * So a window sending its own report must pass `to`, or the derived target is itself.
+ *
+ * Refusing is not enough on its own: the window has to be told what to do instead, or it
+ * will retry with a different file or give up. These tests pin that guidance — including
+ * that the suggested address is one that actually works, read from who really dispatched.
+ */
+describe('report direction (派工 vs 回报)', () => {
+  /** Commander dispatches to the worker, so the worker's log records the sender. */
+  async function afterDispatch() {
+    const { tools, commander, workerAgents } = hostWith()
+    const worker = workerAgents[0].agent
+    await callTool(tools, 'register_session_role', { role: '指挥官助理' }, { agent: commander })
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: worker })
+    await callTool(tools, 'dispatch_card', { card_path: 'cards/派工单-a（后端窗口）.md' }, { agent: commander })
+    return { tools, commander, worker }
+  }
+
+  test('a window sending its own report without `to` is refused, not silently misdelivered', async () => {
+    const { tools, worker } = await afterDispatch()
+    const outcome = await tryTool(tools, 'dispatch_card', { card_path: 'S1-X-回报-Y（后端窗口·20260302）.md' }, { agent: worker })
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /itself/)
+  })
+
+  test('detection is structural, not based on the word 回报 in the filename', async () => {
+    // The original implementation sniffed the filename for "回报"/"停手". That is fragile:
+    // a team may name reports any way it likes. The robust signal is that the target was
+    // *derived from the filename* and came out as the caller — nobody dispatches to itself,
+    // so that combination can only mean "this file is my own report".
+    //
+    // This filename deliberately contains no report keyword.
+    const { tools, worker } = await afterDispatch()
+    const outcome = await tryTool(tools, 'dispatch_card', { card_path: 'notes/2026-03-02-review-of-parse-chain（后端窗口）.md' }, { agent: worker })
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /REPORT/)
+    assert.match(outcome.error, /WROTE/)
+  })
+
+  test('an explicit `to` equal to oneself is still refused, and still explains', async () => {
+    const { tools, worker } = await afterDispatch()
+    const outcome = await tryTool(
+      tools, 'dispatch_card',
+      { card_path: 'notes/anything（后端窗口）.md', to: '后端窗口' },
+      { agent: worker },
+    )
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /itself/)
+    assert.match(outcome.error, /"to"/)
+  })
+
+  test('the refusal explains that a report bracket names the author', async () => {
+    const { tools, worker } = await afterDispatch()
+    const outcome = await tryTool(tools, 'dispatch_card', { card_path: 'S1-X-回报-Y（后端窗口）.md' }, { agent: worker })
+    assert.equal(outcome.ok, false)
+    // The explanation the window needs to unblock itself.
+    assert.match(outcome.error, /REPORT/)
+    assert.match(outcome.error, /WROTE/)
+    assert.match(outcome.error, /"to"/)
+  })
+
+  test('the refusal suggests the address that actually dispatched, and it works', async () => {
+    const { tools, commander, worker } = await afterDispatch()
+    const outcome = await tryTool(tools, 'dispatch_card', { card_path: 'S1-X-回报-Y（后端窗口）.md' }, { agent: worker })
+    assert.equal(outcome.ok, false)
+    // The suggestion comes from the relay message's sender, not from a hard-coded role name,
+    // so it is valid in this workspace by construction.
+    assert.match(outcome.error, /指挥官助理/)
+
+    // Following the advice must succeed — this is what makes the guidance worth printing.
+    const followed = await tryTool(
+      tools, 'dispatch_card',
+      { card_path: 'S1-X-回报-Y（后端窗口）.md', to: '指挥官助理' },
+      { agent: worker },
+    )
+    assert.equal(followed.ok, true)
+    assert.equal(followed.value.targetRole, '指挥官助理')
+    assert.equal(messagesDeliveredTo(commander).length, 1)
+  })
+
+  test('a 停手回报 (stop report) is recognised the same way', async () => {
+    const { tools, worker } = await afterDispatch()
+    const outcome = await tryTool(tools, 'dispatch_card', { card_path: 'S1-X-停手回报（后端窗口·20260302）.md' }, { agent: worker })
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /REPORT/)
+  })
+
+  test('the suggestion falls back to the session id when the sender has no role', async () => {
+    // A dispatcher that never registered a role must still get a usable address.
+    const commander = makeAgent({ id: 'session-cmd', cwd: WORKSPACE })
+    const worker = makeAgent({ id: 'session-worker', cwd: WORKSPACE })
+    const host = makeContext({ agents: [commander, worker] })
+    plugin.apply(host.ctx, { rolesFile })
+    await callTool(host.tools, 'dispatch_card', { card_path: 'x-派工单-a（无角色窗口）.md', to: 'session-worker' }, { agent: commander })
+    // Register the worker's own role so the report filename resolves to it.
+    await callTool(host.tools, 'register_session_role', { role: '无角色窗口' }, { agent: worker })
+
+    const outcome = await tryTool(host.tools, 'dispatch_card', { card_path: 'x-回报-y（无角色窗口）.md' }, { agent: worker })
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /session-cmd/)
+  })
+
+  test('without any prior relay the refusal still tells the window what to do', async () => {
+    // No dispatch happened, so there is no sender to name — the wording must degrade
+    // gracefully rather than inventing or omitting the instruction.
+    const { tools, commander } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '指挥窗口' }, { agent: commander })
+    const outcome = await tryTool(tools, 'dispatch_card', { card_path: 'x-回报-y（指挥窗口）.md' }, { agent: commander })
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /"to"/)
+    assert.match(outcome.error, /list_workspace_sessions/)
+  })
+
+  test('a card sent by the commander is NOT affected by the report rule', async () => {
+    // The normal dispatch path must keep working with no `to` at all.
+    const { tools, commander, worker } = await afterDispatch()
+    const again = await tryTool(tools, 'dispatch_card', { card_path: 'cards/派工单-b（后端窗口）.md' }, { agent: commander })
+    assert.equal(again.ok, true)
+    assert.equal(again.value.targetRole, '后端窗口')
+  })
+
+  test('a third-party report addressed to someone else still resolves normally', async () => {
+    // Regression guard: the guide must not "flip" a legitimate bracket that names a
+    // different session (a tester handing a backend report to the backend window).
+    const tester = makeAgent({ id: 'session-tester', cwd: WORKSPACE })
+    const backend = makeAgent({ id: 'session-backend', cwd: WORKSPACE })
+    const host = makeContext({ agents: [tester, backend] })
+    plugin.apply(host.ctx, { rolesFile })
+    await callTool(host.tools, 'register_session_role', { role: '测试窗口' }, { agent: tester })
+    await callTool(host.tools, 'register_session_role', { role: '后端窗口' }, { agent: backend })
+
+    const outcome = await tryTool(host.tools, 'dispatch_card', { card_path: 'x-回报-y（后端窗口）.md' }, { agent: tester })
+    assert.equal(outcome.ok, true)
+    assert.equal(outcome.value.targetRole, '后端窗口')
+    assert.equal(messagesDeliveredTo(backend).length, 1)
+  })
+
+  test('the dispatch guidance reaches the recipient before they need it', async () => {
+    // The window should learn the rule from the card it receives, not from a failure.
+    const { worker } = await afterDispatch()
+    const text = messagesDeliveredTo(worker)[0].content[0].text
+    assert.match(text, /回报/)
+    assert.match(text, /必须显式给 "to"/)
+  })
+})
+
 describe('role registry resilience', () => {
   test('writes atomically, leaving no partial file behind', () => {
     const { tools, commander } = hostWith()

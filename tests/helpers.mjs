@@ -44,6 +44,12 @@ export function makeAgent({
   events = [],
 } = {}) {
   if (typeof id !== 'string' || id === '') throw new Error('makeAgent requires a non-empty id')
+  // A live log that grows as deliveries arrive, mirroring the real loop: DSH appends each
+  // claimed inbox message as a `user/message` event (`agent-loop/src/agent.ts`). Tests that
+  // depend on *what a session can see about its own history* — the report-target suggestion
+  // reads the sender of the last relayed message — need this to be faithful, otherwise the
+  // fake would silently under-report and look like a plugin bug.
+  const log = [...events]
   const agent = {
     id,
     status,
@@ -55,13 +61,18 @@ export function makeAgent({
         ...origin === undefined ? {} : { origin },
         ...parentSession === undefined ? {} : { parentSession },
       },
-      snapshotEvents: () => events,
+      snapshotEvents: () => log,
     },
     // Deliveries land in one list so tests can tell queue/steer apart by order and
     // still assert on the message objects themselves.
-    followup(message) { this[deliveries].push({ kind: 'followup', message }) },
-    steer(message) { this[deliveries].push({ kind: 'steer', message }) },
-    inject(message) { this[deliveries].push({ kind: 'inject', message }) },
+    followup(message) { this[deliveries].push({ kind: 'followup', message }); append(message) },
+    steer(message) { this[deliveries].push({ kind: 'steer', message }); append(message) },
+    inject(message) { this[deliveries].push({ kind: 'inject', message }); append(message) },
+  }
+  // Waking and non-waking deliveries both become log events in DSH; a receipt is written by
+  // the runtime *into the sender's* log, which is exactly what `inject` models here.
+  const append = (message) => {
+    log.push({ type: 'user/message', data: message, seq: log.length, time: 1_700_000_000_000 + log.length })
   }
   agent[deliveries] = []
   return agent

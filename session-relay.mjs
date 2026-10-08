@@ -386,26 +386,31 @@ const sendTool = {
 const dispatchTool = {
   name: TOOL_DISPATCH,
   description:
-    'Dispatch a card (派工单) or report to the right window in one call, deriving the target from the '
-    + 'filename. The default convention is that a card ends with "（<角色>窗口）" — for example '
-    + '"2026-03-01-派工单-重构解析链（后端窗口）.md" targets the role "后端窗口". Pass just card_path '
-    + 'and the tool reads the target off the filename; pass "to" to override it when the file does not '
-    + 'follow that convention. The recipient is told to read the file first and starts working '
-    + 'immediately. Use this instead of send_session_message whenever you are handing over a card.',
+    'Hand over a file — a dispatch card (派工单) or a report (回报) — to the right window in one call, '
+    + 'deriving the target from the filename. The convention is that such a file ends with '
+    + '"（<角色>窗口）", for example "2026-03-01-派工单-重构解析链（后端窗口）.md". '
+    + '⚠️ That bracket has two opposite meanings: on a DISPATCH CARD it names the RECIPIENT (pass just '
+    + 'card_path), but on a REPORT it names who WROTE the file — so when you send your own report you '
+    + 'MUST pass "to" (for example to: "指挥官助理") or the tool would address it back to you. '
+    + 'The recipient is told to read the file first and starts working immediately. '
+    + 'Use this instead of send_session_message whenever you are handing over a card or a report file.',
   parameters: {
     type: 'object',
     properties: {
       card_path: {
         type: 'string',
         description:
-          'Path to the card or report file. Its trailing "（<角色>窗口）" is used as the target unless '
-          + '"to" is given. Example: "cards/2026-03-01-派工单-重构解析链（后端窗口）.md".',
+          'Path to the card or report file. For a DISPATCH CARD its trailing "（<角色>窗口）" names the '
+          + 'recipient and is used as the target. Example: "cards/2026-03-01-派工单-重构解析链（后端窗口）.md". '
+          + '⚠️ For a REPORT (回报) that bracket names who WROTE the file, so you must pass "to" yourself.',
       },
       to: {
         type: 'string',
         description:
-          'Optional explicit target (a role name or session id). Overrides the target derived from the '
-          + 'filename. Needed only for files that do not follow the naming convention.',
+          'Explicit target (a role name or session id). Overrides whatever the filename suggests. '
+          + 'Required when sending a REPORT (回报/停手回报): a report filename\'s bracket names its '
+          + 'author (probably you), not its destination — pass to: "指挥官助理" to send it back to '
+          + 'whoever dispatched to you. Also use it for files that do not follow the naming convention.',
       },
       message: {
         type: 'string',
@@ -721,6 +726,58 @@ function liveStatus(services, id, live) {
   return live === true ? 'idle' : 'cold'
 }
 
+/**
+ * 找出"最近给本会话派过工"的会话，作为回报的默认去向。
+ *
+ * 回报报错里如果说一个硬编码的角色名（如「指挥官助理」），在别的部署里可能根本不存在，
+ * 等于把用户往第二次失败上引。而本插件其实**已经知道**是谁派工过来的——那条转达消息的
+ * `senderSessionId` 就写在会话日志里。所以直接读出来，给出一个**当下一定可用**的地址。
+ *
+ * 先试 `senderSessionId`（精确、不依赖角色名册），再退回发送方登记的角色名（更好读）。
+ * @param services - 插件作用域的服务句柄。
+ * @param agent - 当前（要回报的）会话所属 Agent。
+ * @returns 建议的 `to` 取值，以及它是不是一个角色名；找不到则为 undefined。
+ */
+function suggestReportTarget(services, agent) {
+  try {
+    const events = agent?.session?.snapshotEvents?.() ?? []
+    for (let index = events.length - 1; index >= 0; index--) {
+      const event = events[index]
+      if (event?.type !== 'user/message') continue
+      const source = event.data?.source
+      if (source?.kind !== RELAY_SOURCE_KIND) continue
+      const senderId = source.senderSessionId
+      if (typeof senderId !== 'string' || senderId === '') continue
+      // 发送方登记过角色名的话，用角色名更好读，也更稳定（会话重建后仍可用）。
+      const cwd = agent.session.header.cwd
+      const role = cwd === undefined ? undefined : roleOfSession(cwd, senderId)
+      return role === undefined
+        ? { to: senderId, isRole: false }
+        : { to: role, isRole: true }
+    }
+  } catch {
+    // 读不到就退化为"不给出具体地址"，报错文案仍会说明该做什么。
+  }
+  return undefined
+}
+
+/**
+ * 构造"你大概是要发回报"的那段指引。
+ * @param services - 插件作用域的服务句柄。
+ * @param agent - 回报的发出方（也就是自己）。
+ * @returns 可直接拼进报错的指引文本。
+ */
+function reportHint(services, agent) {
+  const suggestion = suggestReportTarget(services, agent)
+  const tail = suggestion === undefined
+    ? `Pass "to" explicitly with the role or session id of whoever dispatched to you `
+    : `Pass "to": ${JSON.stringify(suggestion.to)} to send it back to the session that dispatched this task `
+  return 'This looks like a REPORT (回报): a report filename\'s trailing bracket names who WROTE it '
+    + '(you), not who receives it. '
+    + tail
+    + `(see ${TOOL_LIST}). `
+}
+
 /* ------------------------------------------------------------------ 投递实现 */
 
 /**
@@ -798,6 +855,12 @@ async function dispatchCard(services, exec, args) {
     mode: args?.mode === 'steer' ? 'steer' : 'queue',
     expectReceipt: args?.expect_receipt !== false,
     tool: TOOL_DISPATCH,
+    // 关键信号：目标是否**由文件名推导**而来。
+    //
+    // 这比"文件名里有没有『回报』二字"可靠得多：**只要推导出的目标恰好是调用方自己**，
+    // 就一定是"这是一份回报"的情形——因为正常工作流里，没有人会把派工单发给自己。
+    // （曾用文件名字符串嗅探，但文件名写法千变万化，靠不住；这条判据是结构性的。）
+    targetDerivedFromFilename: explicitTo === '' && derived !== undefined,
   })
 
   return {
@@ -891,7 +954,28 @@ async function deliverMessage(services, exec, spec) {
   const resolved = resolveTarget(services, callerCwd, to)
   const targetId = resolved.sessionId
   if (targetId === callerId) {
-    throw new Error(`${tool}: refusing to send a message to the calling session itself ("${callerId}")`)
+    // 这条报错最常见的成因**不是**"想发给自己"，而是"这是一份*回报*"：
+    // 派工单文件名的括号标的是**收件人**（这卡给谁），而回报文件名的括号标的是
+    // **作者**（谁写的）——同一个位置，两个相反的含义（见 README 的"回报方向"一节）。
+    // 于是窗口回报时若只给 card_path，目标会被推导成它自己。
+    //
+    // 所以这里必须把"该怎么发回报"直接说出来：只说"不能发给自己"会让窗口一头雾水，
+    // 它更可能换个文件重试或干脆放弃，而不是想到要补一个 `to`。
+    //
+    // 判定用两个信号，优先结构性信号：
+    //   ① 目标**由文件名推导**且等于调用方自己 ⇒ 这必然是"我发的回报"（没人会派工给自己）；
+    //   ② 否则退回文件名词嗅探（覆盖 send_session_message 里直接把回报文件名当 to 传的情况）。
+    const derivedSelf = spec.targetDerivedFromFilename === true
+    const looksLikeReport = derivedSelf
+      || /回报|停手|report/i.test(String(to))
+      || /回报|停手|report/i.test(String(cardPath ?? ''))
+    throw new Error(
+      `${tool}: refusing to send a message to the calling session itself ("${callerId}"). `
+      + (looksLikeReport
+        ? reportHint(services, caller)
+        : 'A dispatch card\'s trailing bracket names the RECIPIENT, so if the file you are sending is '
+          + 'your own report, that bracket is your own role and you must pass "to" explicitly instead. ')
+    )
   }
 
   exec.signal?.throwIfAborted()
@@ -1043,6 +1127,10 @@ function createRelayMessage(services, caller, options) {
     '── 回信方式 ──',
     `收到后请先回一句「已收卡」（用 ${reply}），让我知道卡已经到你手上；`,
     '干完后把回报也发回同一个地址。回复是可选的，但本工作区的既有约定是「开工前先回报一句」。',
+    '',
+    `⚠️ 若你改用 ${TOOL_DISPATCH} 发回报文件，**必须显式给 "to"**（例如 to: ${JSON.stringify(callerRole ?? callerId)}）：`,
+    '回报文件名的括号标的是**谁写的**（也就是你自己），不像派工单那样标收件人——',
+    '只给 card_path 会被解析成发给你自己。',
   )
 
   return freezeMessage({
