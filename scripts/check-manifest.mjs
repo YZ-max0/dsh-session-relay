@@ -176,6 +176,11 @@ try {
 
 if (plugin !== undefined) {
   if (typeof plugin.name !== 'string' || plugin.name === '') fail('plugin must export a string `name`')
+  // The plugin id, npm name and tool names must stay ASCII: they travel through npm, YAML
+  // config, model requests and JSON Schema. The Chinese display name lives in docs only.
+  if (typeof plugin.name === 'string' && !/^[\x20-\x7e]+$/.test(plugin.name)) {
+    fail(`plugin id "${plugin.name}" must be ASCII (the Chinese display name belongs in docs)`)
+  }
   if (!Array.isArray(plugin.inject)) fail('plugin must export an `inject` array')
   if (typeof plugin.apply !== 'function') fail('plugin must export an `apply` function')
   // DSH's Loader discards a function plugin's `inject` when the module also default-exports.
@@ -226,6 +231,9 @@ if (plugin !== undefined) {
     }
     if (typeof definition.execute !== 'function') fail(`tool "${name}" has no execute function`)
     if (typeof definition.output?.render !== 'function') fail(`tool "${name}" has no output.render`)
+    if (!/^[a-z][a-z0-9_]*$/.test(name)) {
+      fail(`tool name "${name}" must be lower-case ASCII snake_case (it reaches model requests and the session log)`)
+    }
     checkSchema(definition.parameters, `${name}.parameters`)
     checkSchema(definition.output?.schema, `${name}.output.schema`)
 

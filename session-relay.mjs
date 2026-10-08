@@ -1,5 +1,11 @@
 /**
- * session-relay — 让同一工作区内的会话互相派工与回报（DSH 插件）
+ * session-relay（中文名：**驿传**）— 让同一工作区内的会话互相派工与回报（DSH 插件）
+ *
+ * 名字取自中国古代的接力传书体系：文书逐站传递、每站交接须回执。与本插件机制逐点
+ * 对应——会话之间接力传递任务卡、每次投递自动写回执、按稳定"站名"（角色）寻址。
+ * `relay` 本身也是"接力传递"，中英两名语义一致。
+ *
+ * 注：`session-relay` 是插件 id / npm 包名，必须保持 ASCII；`驿传` 是中文显示名。
  *
  * ── 解决什么问题 ────────────────────────────────────────────────────────
  * 用 DSH 做多角色协作时，常见分工是：一个**指挥**会话负责拆任务、写派工单
@@ -64,13 +70,21 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 
-/** Cordis 插件名。 */
+/**
+ * Cordis 插件 id（必须 ASCII）。中文显示名为「驿传」，见模块顶部注释；
+ * 它在 `cordis.patch.yml` 的 `id:` 与 npm 包名 `dsh-session-relay` 中都要保持一致。
+ */
 export const name = 'session-relay'
 
 /** 只要工具注册表就绪即可激活；其余服务以 `ctx.get()` 可选取用并给出明确报错。 */
 export const inject = ['tools']
 
-/** 模型可见的工具名。 */
+/**
+ * 模型可见的工具名。
+ *
+ * 一律用小写 ASCII 蛇形：工具名要进模型请求、进 JSON Schema、进 session log，
+ * 保持 ASCII 可避免不同 provider/客户端在编码上的意外差异。**中文名只用于文档。**
+ */
 const TOOL_LIST = 'list_workspace_sessions'
 const TOOL_REGISTER = 'register_session_role'
 const TOOL_SEND = 'send_session_message'

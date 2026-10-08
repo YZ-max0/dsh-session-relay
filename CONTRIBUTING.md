@@ -1,6 +1,12 @@
 # 贡献指南
 
+**dsh-session-relay · 驿传** —— 让 DSH 里同一工作区的会话互相派工与回报。
+
 感谢有兴趣改进这个项目。它很小，规则也很简单。
+
+> 命名约定：`驿传` 是中文显示名；npm 包名（`dsh-session-relay`）、cordis 插件 id
+> （`session-relay`）、工具名一律保持 **ASCII** —— 它们要进 npm registry、YAML 配置、
+> 模型请求与 JSON Schema，非 ASCII 会带来不必要的编码风险。新增文档时请沿用此约定。
 
 ## 开发环境
 
