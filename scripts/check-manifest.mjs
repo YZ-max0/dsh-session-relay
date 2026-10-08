@@ -314,41 +314,50 @@ pass(`no private identifiers in ${scanned} tracked text files`)
  * Keep "N 个测试" claims in the docs honest.
  *
  * Why this check exists: I wrote a stale test count into the README **three times**
- * (83, then 78, then 98 — while the suite had grown to 100). Nothing caught it, because a
- * wrong number in prose looks exactly like a right one. It only surfaces when a reader
- * trusts it and is misled.
+ * (83, then 78, then 98 — while the suite had grown). Nothing caught it, because a wrong
+ * number in prose looks exactly like a right one. It only surfaces when a reader trusts it.
  *
- * The fix is not discipline, it is automation: read the real count from the test runner
- * and compare it against every documented claim.
+ * Why it counts *declarations* instead of running the suite: the runtime count depends on
+ * the environment. `tests/integration-dsh.test.mjs` **skips its 5 tests when DSH is not
+ * installed**, and Node omits skipped subtests from `# tests` entirely. So `node --test`
+ * reports 100 on a developer machine and 95 on CI — a first version of this check compared
+ * against the runtime number and failed CI for that reason. The number of declared tests is
+ * a property of the source, identical everywhere, which is what a documented claim means.
  */
+const TESTS_DIR = join(root, 'tests')
 try {
-  const output = execFileSync(process.execPath, ['--test'], {
-    cwd: root,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-  })
-  const actual = /^# tests (\d+)$/m.exec(output)?.[1]
-  if (actual === undefined) {
-    fail('could not read the test count from `node --test` output')
+  const files = existsSync(TESTS_DIR)
+    ? readdirSync(TESTS_DIR).filter(name => name.endsWith('.test.mjs'))
+    : []
+  if (files.length === 0) {
+    fail('found no test files to count under tests/')
   } else {
-    const CLAIM = /(\d+)\s*个测试/g
-    let claims = 0
-    for (const relative of trackedFiles()) {
-      if (!relative.endsWith('.md')) continue
-      const text = readFileSync(join(root, relative), 'utf8')
-      for (const match of text.matchAll(CLAIM)) {
-        claims += 1
-        if (match[1] !== actual) {
-          fail(`${relative}: says "${match[0]}" but the suite has ${actual} tests`)
+    let declared = 0
+    for (const name of files) {
+      const text = readFileSync(join(TESTS_DIR, name), 'utf8')
+      declared += (text.match(/^\s*(?:test|it)(?:\.\w+)?\(/gm) ?? []).length
+    }
+    if (declared === 0) {
+      fail('counted zero declared tests — the counter no longer matches how tests are written')
+    } else {
+      const CLAIM = /(\d+)\s*个测试/g
+      let claims = 0
+      for (const relative of trackedFiles()) {
+        if (!relative.endsWith('.md')) continue
+        const text = readFileSync(join(root, relative), 'utf8')
+        for (const match of text.matchAll(CLAIM)) {
+          claims += 1
+          if (match[1] !== String(declared)) {
+            fail(`${relative}: says "${match[0]}" but the suite declares ${declared} tests`)
+          }
         }
       }
+      if (claims === 0) notes.push('no documented test count to verify')
+      else pass(`documented test count matches the suite (${declared})`)
     }
-    // A claim that vanished entirely is also a drift signal, but a soft one.
-    if (claims === 0) notes.push('no documented test count to verify')
-    else pass(`documented test count matches the suite (${actual})`)
   }
 } catch (error) {
-  fail(`could not run the test suite to verify documented counts: ${error.message}`)
+  fail(`could not count declared tests: ${error.message}`)
 }
 
 /* ---------------------------------------------------------------------- report */
