@@ -160,6 +160,10 @@ def main() -> int:
         print("     否则重启 DSH。")
         print("  2. 在同一工作区里再开一个会话，然后让某个会话调用")
         print("     list_workspace_sessions，应能看到对方；再用 send_session_message 发消息。")
+        print()
+        print("⚠️ 重要：以后若修改了 session-relay.mjs 的【源码】，必须【重启 DSH】才生效。")
+        print("   配置热重载（patchReload: live）只作用于 YAML，不会重新加载插件模块代码。")
+        print("   实测踩过这个坑：改完源码没重启，DSH 继续跑旧版，表现为「修复不生效」。")
     return 0
 
 

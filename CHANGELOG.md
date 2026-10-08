@@ -91,5 +91,14 @@
 - 派工消息里的回信指引补充了"改用 `dispatch_card` 发回报必须给 `to`"的提醒，
   让窗口在**踩坑之前**就知道规则。
 
+### 文档
+
+- **补充「改源码需重启 DSH」的说明**（README + `install.py` 收尾提示）。
+  这是实测踩到的坑：`patchReload: live` 只热重载 **YAML 配置**，**不会**重新加载插件
+  模块代码。改完 `.mjs` 源码未重启时，DSH 继续跑旧版，表现为"修复明明做了却不生效"。
+  排查此类问题的判据：**看运行时的实际输出**（新版文案/字段），而不是看磁盘文件——
+  磁盘是最新的，进程里的是旧的。
+
+
 [Unreleased]: https://github.com/YZ-max0/dsh-session-relay/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/YZ-max0/dsh-session-relay/releases/tag/v0.1.0

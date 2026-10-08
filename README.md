@@ -74,7 +74,22 @@
 dsh plugin --profile web add github:YZ-max0/dsh-session-relay
 ```
 
-本仓库按 DSH 官方插件形态打包（`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`），所以这条命令即可。安装后重启 DSH，或让 profile 的 `patchReload: live` 自动热重载。
+本仓库按 DSH 官方插件形态打包（`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`），所以这条命令即可。
+
+### ⚠️ 改了插件源码之后：必须重启 DSH
+
+这是**实测踩过的坑**，务必分清两件事：
+
+| 你改了什么 | 怎么生效 |
+|---|---|
+| profile 的 `cordis.patch.yml`（**配置**） | `patchReload: live` 时**保存即生效**，不用重启 |
+| 插件的 **`.mjs` 源码** | **必须重启 DSH**（或重新打开窗口）——配置热重载**不会**重新加载模块代码 |
+
+**踩坑记录**：改完源码只更新了磁盘文件、没有重启，DSH 就继续跑**旧版代码**。
+表现是"修复明明做了却不生效"，排查了很久才发现是**部署问题、不是代码问题**。
+
+排查这类"改了不生效"，最快的判据是**看运行时的实际输出**是否符合新版的文案或字段，
+而不是看磁盘上的文件——**磁盘是最新的，进程里的是旧的**。
 
 ### 方式二：本地 checkout（不安装 npm 包）
 
