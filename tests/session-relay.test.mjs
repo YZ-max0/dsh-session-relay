@@ -723,6 +723,54 @@ describe('dispatch_card', () => {
     assert.equal(messagesDeliveredTo(workerAgents[1].agent).length, 1)
   })
 
+  test('the reply block names the DISPATCHER, not the card author\u2019s assumption', async () => {
+    // Found in production: one card was dispatched by two different sessions. The recipient
+    // got two contradictory reply addresses — the runtime's "reply to whoever dispatched
+    // this", and an address hard-coded in the card body — and could not tell which to obey.
+    //
+    // The runtime block must win, because only it knows who actually handed over the card.
+    const { tools, commander, workerAgents } = hostWith()
+    const worker = workerAgents[0].agent
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: worker })
+    await callTool(tools, 'dispatch_card', { card_path: 'x-派工单-y（后端窗口）.md' }, { agent: commander })
+
+    const text = messagesDeliveredTo(worker)[0].content.map(part => part.text).join('\n')
+    assert.match(text, /回信地址以本块为准/)
+    // The commander dispatched it and has no registered role, so its session id is the address.
+    assert.match(text, /send_session_message\(\{ to: "session-commander", \.\.\. \}\)/)
+  })
+
+  test('the reply block follows the dispatcher when two sessions send the same card', async () => {
+    // The exact production shape: the same card file, handed over by two different sessions.
+    // Each recipient must be told to reply to ITS OWN dispatcher — which is precisely why a
+    // card body must not hard-code a recipient.
+    const first = makeAgent({ id: 'session-dispatcher-a', cwd: WORKSPACE })
+    const second = makeAgent({ id: 'session-dispatcher-b', cwd: WORKSPACE })
+    const worker = makeAgent({ id: 'session-worker', cwd: WORKSPACE })
+    const host = makeContext({ agents: [first, second, worker] })
+    plugin.apply(host.ctx, { rolesFile })
+    await callTool(host.tools, 'register_session_role', { role: '后端窗口' }, { agent: worker })
+    await callTool(host.tools, 'register_session_role', { role: '派工方甲' }, { agent: first })
+    await callTool(host.tools, 'register_session_role', { role: '派工方乙' }, { agent: second })
+
+    const card = 'x-派工单-z（后端窗口）.md'
+    await callTool(host.tools, 'dispatch_card', { card_path: card }, { agent: first })
+    await callTool(host.tools, 'dispatch_card', { card_path: card }, { agent: second })
+
+    const texts = messagesDeliveredTo(worker).map(m => m.content.map(p => p.text).join('\n'))
+    assert.equal(texts.length, 2)
+    // Extract the address from the reply call itself. Asserting on the raw text would pass
+    // vacuously: the message header also names the sender's role, so a bare /"派工方甲"/
+    // matches the header even when the reply block points somewhere else.
+    const replyAddress = (text) => {
+      const match = /send_session_message\(\{ to: ("[^"]+"),/.exec(text)
+      assert.ok(match !== null, 'reply block must name an address')
+      return match[1]
+    }
+    assert.equal(replyAddress(texts[0]), '"派工方甲"')
+    assert.equal(replyAddress(texts[1]), '"派工方乙"')
+  })
+
   test('strips a trailing date from a report filename', async () => {
     const { tools, commander, workerAgents } = hostWith()
     await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })

@@ -1143,13 +1143,21 @@ function createRelayMessage(services, caller, options) {
   }
   if (options.text.trim() !== '') blocks.push(options.text, '')
 
-  const reply = `send_session_message({ to: ${JSON.stringify(callerRole ?? callerId)}, ... })`
+  // 回信地址以**本块**为准：它由运行时在派工那一刻生成，反映"谁把这张卡派给你的"。
+  // 卡片正文里若写死了别的收件人（例如"回报给指挥官助理"），那是卡作者的假设——
+  // 卡被转发/转派后就不再成立。实测踩过：同一张卡被两个不同会话派发时，
+  // 收件方拿到两个互相矛盾的回信地址，不知该听谁的。
+  const replyTarget = JSON.stringify(callerRole ?? callerId)
+  const reply = `send_session_message({ to: ${replyTarget}, ... })`
   blocks.push(
     '── 回信方式 ──',
     `收到后请先回一句「已收卡」（用 ${reply}），让我知道卡已经到你手上；`,
     '干完后把回报也发回同一个地址。回复是可选的，但本工作区的既有约定是「开工前先回报一句」。',
     '',
-    `⚠️ 若你改用 ${TOOL_DISPATCH} 发回报文件，**必须显式给 "to"**（例如 to: ${JSON.stringify(callerRole ?? callerId)}）：`,
+    `🔴 **回信地址以本块为准**：${replyTarget} 就是**把这张卡派给你的那个会话**。`,
+    '若卡片正文里写了别的收件人，那是卡作者原来的假设——卡可能被转派，所以以本块为准。',
+    '',
+    `⚠️ 若你改用 ${TOOL_DISPATCH} 发回报文件，**必须显式给 "to"**（例如 to: ${replyTarget}）：`,
     '回报文件名的括号标的是**谁写的**（也就是你自己），不像派工单那样标收件人——',
     '只给 card_path 会被解析成发给你自己。',
   )
