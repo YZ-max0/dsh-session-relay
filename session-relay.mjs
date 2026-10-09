@@ -603,10 +603,61 @@ function saveRoles(roles) {
   }
 }
 
-/** 锁目录的陈旧阈值：超过此时长视为上一个持有者已崩溃，允许抢占。 */
-const ROLES_LOCK_STALE_MS = 10_000
-/** 等锁的最长时间；超过就放弃（宁可报错，也不要无限阻塞模型轮次）。 */
-const ROLES_LOCK_TIMEOUT_MS = 5_000
+  /**
+   * 锁目录的陈旧阈值：超过此时长视为持有者已崩溃，允许抢占。
+   *
+   * ⚠️ 它必须 **明显大于** 正常临界段时长，又 **必须小于** {@link ROLES_LOCK_TIMEOUT_MS}：
+   *  - 太大 ⇒ 持有者崩溃后要等很久才能自愈
+   *  - 不小于等待上限 ⇒ 等待方在自己的时限内**永远等不到**那把锁变陈旧，
+   *    自愈就成了空话（实测：刚创建的锁会让登记在 5s 后直接失败退出）
+   * 临界段是一次 JSON 读 + 一次写，正常在毫秒级，2 秒已是极宽裕的余量。
+   */
+  const ROLES_LOCK_STALE_MS = 2_000
+
+  /**
+   * 等锁的最长时间；超过就放弃（宁可报错，也不要无限阻塞模型轮次）。
+   * 必须 **大于** {@link ROLES_LOCK_STALE_MS}，否则一次调用内无法回收陈旧锁。
+   */
+  const ROLES_LOCK_TIMEOUT_MS = 10_000
+
+/**
+ * 判断一把锁是否可以安全抢占（持有者已崩溃）。
+ *
+ * 判据优先看**持有者进程是否还活着**（锁目录里记了 pid）：
+ *   - `kill(pid, 0)` 抛 `ESRCH` ⇒ 进程不存在 ⇒ 持有者已死，可抢占。
+ *   - 进程仍在 ⇒ **不抢占**，无论锁已经握了多久。只看时长会误伤"还活着但临界段偏慢"的
+ *     持有者（大文件、网络盘），删掉它的锁等于让两个进程同时进临界段，丢失更新又回来了。
+ *   - 读不到 pid（旧版本留下的锁、权限问题、pid 复用等无法判定）⇒ 退回 mtime 超时判断，
+ *     保证一个崩溃的旧锁最终仍能自愈。
+ *
+ * 注意 pid 复用会让"进程还活着"成为假阳性——那只是让抢占更保守（宁可多等），
+ * 不会破坏正确性；配合外层超时，最坏情况是明确报错而非静默错写。
+ *
+ * @param lockDir - 锁目录。
+ * @param ownerFile - 记录持有者 pid 的文件。
+ * @returns 是否可抢占。
+ */
+function isLockStealable(lockDir, ownerFile) {
+  try {
+    const raw = readFileSync(ownerFile, 'utf8').trim()
+    const pid = Number.parseInt(raw, 10)
+    if (Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0) // 只探测，不发信号。
+        return false // 持有者活着。
+      } catch (error) {
+        if (error?.code === 'ESRCH') return true // 进程不存在 ⇒ 崩溃了。
+        // EPERM 等：进程存在但不属于我们 ⇒ 保守起见不抢占。
+        return false
+      }
+    }
+  } catch { /* 读不到 pid：落到 mtime 判断 */ }
+  try {
+    return Date.now() - statSync(lockDir).mtimeMs > ROLES_LOCK_STALE_MS
+  } catch {
+    return false // 锁已经没了，下一轮直接拿。
+  }
+}
 
 /**
  * 用 `mkdir` 的原子性做**跨进程**互斥，执行一次"读-改-写"。
@@ -628,6 +679,7 @@ const ROLES_LOCK_TIMEOUT_MS = 5_000
  */
 async function withRolesLock(job) {
   const lockDir = `${rolesFile()}.lock`
+  const ownerFile = join(lockDir, 'owner')
   const dir = dirname(lockDir)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
   const deadline = Date.now() + ROLES_LOCK_TIMEOUT_MS
@@ -638,17 +690,17 @@ async function withRolesLock(job) {
   for (;;) {
     try {
       mkdirSync(lockDir)
+      // 记下持有者 pid：抢占判断以"持有者是否还活着"为主，而不是只看时长——
+      // 只看 mtime 会把**还活着但临界段偏慢**的持有者（大文件/网络盘）误判成崩溃，
+      // 删掉它的锁并双双进入临界段，丢失更新又回来了。
+      try { writeFileSync(ownerFile, `${process.pid}\n`, 'utf8') } catch { /* 写不进就退回 mtime 判断 */ }
       break
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error
-      // 抢占陈旧的锁（持有者崩溃的情形）。
-      try {
-        const age = Date.now() - statSync(lockDir).mtimeMs
-        if (age > ROLES_LOCK_STALE_MS) {
-          rmSync(lockDir, { recursive: true, force: true })
-          continue
-        }
-      } catch { /* 锁刚好被释放了，下一轮会拿到 */ }
+      if (isLockStealable(lockDir, ownerFile)) {
+        try { rmSync(lockDir, { recursive: true, force: true }) } catch { /* 别人先删了 */ }
+        continue
+      }
       if (Date.now() >= deadline) {
         throw new Error(
           `timed out waiting for the role registry lock at ${lockDir}. `

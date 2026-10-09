@@ -9,7 +9,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync } from 'node:fs'
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
@@ -132,6 +132,36 @@ describe('register_session_role', () => {
       `all ${roles.length} concurrent registrations must survive, got ${JSON.stringify(Object.keys(saved))}`,
     )
     assert.equal(existsSync(`${rolesFile}.lock`), false, 'the lock must be released')
+  })
+
+  test('a lock held by a CRASHED process is reclaimed immediately', async () => {
+    // Otherwise one dead process would wedge every future registration. The lock records the
+    // holder's pid, and `kill(pid, 0)` throwing ESRCH is proof the holder is gone.
+    const { tools, commander } = hostWith()
+    mkdirSync(`${rolesFile}.lock`, { recursive: true })
+    // A pid that cannot be running (above the usual max) stands in for a crashed holder.
+    writeFileSync(join(rolesFile + '.lock', 'owner'), '999999')
+    const started = Date.now()
+    const outcome = await tryTool(tools, 'register_session_role', { role: '甲窗口' }, { agent: commander })
+    assert.equal(outcome.ok, true, 'a dead holder must not wedge the registry')
+    assert.ok(Date.now() - started < 1000, 'reclaiming must be immediate, not a stale timeout wait')
+    rmSync(`${rolesFile}.lock`, { recursive: true, force: true })
+  })
+
+  test('a lock held by a LIVE process is never stolen, however old', async () => {
+    // The counterpart risk: judging staleness by time alone lets a slow-but-alive holder
+    // (large registry, network storage) have its lock deleted underneath it, so both
+    // processes enter the critical section and the lost-update bug returns.
+    const { tools, commander } = hostWith()
+    const lockDir = `${rolesFile}.lock`
+    mkdirSync(lockDir, { recursive: true })
+    writeFileSync(join(lockDir, 'owner'), String(process.pid)) // this test process: definitely alive
+    const ancient = Date.now() / 1000 - 3600
+    utimesSync(lockDir, ancient, ancient) // an hour old — well past any stale threshold
+    const outcome = await tryTool(tools, 'register_session_role', { role: '甲窗口' }, { agent: commander })
+    assert.equal(outcome.ok, false, 'must not steal from a live holder')
+    assert.match(outcome.error, /timed out/)
+    rmSync(lockDir, { recursive: true, force: true })
   })
 
   test('waiting for the lock does NOT block the event loop', async () => {
