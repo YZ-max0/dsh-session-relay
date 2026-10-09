@@ -248,6 +248,8 @@ const listTool = {
         selfSessionId: { type: 'string' },
         selfRole: { type: 'string' },
         workspace: { type: 'string' },
+        // 名册读不出来时如实告知：否则用户只看到「你没有角色」，不知为何。
+        registryError: { type: 'string' },
         total: { type: 'integer' },
         sessions: {
           type: 'array',
@@ -835,14 +837,24 @@ async function listWorkspaceSessions(services, exec, args) {
   const needle = typeof args?.query === 'string' ? args.query.trim().toLocaleLowerCase() : ''
 
   const records = await collectWorkspaceSessions(services, callerCwd, exec.signal)
-  const table = callerCwd === undefined ? {} : rolesForWorkspace(callerCwd)
-  const selfRole = callerCwd === undefined ? undefined : roleOfSession(callerCwd, callerId)
+    // 只读路径不该因名册损坏而整体失败，但**必须如实说明**——否则用户只看到
+    // 「你没有角色 / 列表里没有角色」，却不知道名册根本读不出来（实测踩过这个混淆）。
+    const { roles: allRoles, error: registryError } = loadRolesLenient()
+    const bucket = callerCwd === undefined ? undefined : allRoles[callerCwd]
+    const table = bucket !== null && typeof bucket === 'object' ? { ...bucket } : {}
+    const roleOf = (sessionId) => {
+      for (const [role, entry] of Object.entries(table)) {
+        if (entry?.sessionId === sessionId) return role
+      }
+      return undefined
+    }
+    const selfRole = callerCwd === undefined ? undefined : roleOf(callerId)
 
   const sessions = []
   for (const record of records) {
     const id = String(record.header.id)
     if (id === callerId) continue
-    const role = callerCwd === undefined ? undefined : roleOfSession(callerCwd, id)
+    const role = callerCwd === undefined ? undefined : roleOf(id)
     const title = projectedTitle(services, record.header)
     if (needle !== '') {
       const haystack = [id, role ?? '', title ?? '', record.header.cwd ?? ''].join('\u0000').toLocaleLowerCase()
@@ -870,6 +882,7 @@ async function listWorkspaceSessions(services, exec, args) {
     ...callerCwd === undefined ? {} : { workspace: callerCwd },
     total: sessions.length,
     sessions: sessions.slice(0, limit),
+      ...registryError === undefined ? {} : { registryError },
   }
 }
 
@@ -1123,15 +1136,16 @@ async function deliverMessage(services, exec, spec) {
   const callerId = String(caller.id)
   const callerCwd = caller.session.header.cwd
 
+  // 长度上限施加在**最终投递的那条消息**上，而不是逐字段——
+  // 逐字段会漏：`message` 与 `card_path` 各自不超限，拼起来却可以接近两倍
+  // （实测 8000+8000 ⇒ 收件方收到 16,753 字符，而文档声称上限 8000）。
+  // 报错时指出是哪个字段过大，便于调用方直接改对。
   if (text.length > MESSAGE_MAX_CHARS) {
     throw new Error(
       `${tool}: message is ${text.length} characters; the limit is ${MESSAGE_MAX_CHARS}. `
       + 'Hand over a long document by putting it in a file and passing "card_path" instead.',
     )
   }
-  // `card_path` 同样进收件方的上下文，因此必须受同一个上限约束。
-  // 早先只查了 `message`，于是 `card_path` 成了绕过上限的后门：实测传入 5 万字符的
-  // 路径会被原样接受。虽然正常路径都很短，但"限额只管一半"本身就是漏洞。
   if (cardPath.length > MESSAGE_MAX_CHARS) {
     throw new Error(
       `${tool}: card_path is ${cardPath.length} characters; the limit is ${MESSAGE_MAX_CHARS}.`,
@@ -1204,13 +1218,21 @@ async function deliverMessage(services, exec, spec) {
     const looksLikeReport = derivedSelf
       || /回报|停手|report/i.test(String(to))
       || /回报|停手|report/i.test(String(cardPath ?? ''))
-    throw new Error(
-      `${tool}: refusing to send a message to the calling session itself ("${callerId}"). `
-      + (looksLikeReport
-        ? reportHint(services, caller)
-        : 'A dispatch card\'s trailing bracket names the RECIPIENT, so if the file you are sending is '
-          + 'your own report, that bracket is your own role and you must pass "to" explicitly instead. ')
-    )
+      // 两种成因都可能，且**无法从文件名可靠区分**：
+      //   ① 回报：文件名的括号标的是**作者**（自己）⇒ 推出来就是自己，需要补 `to`；
+      //   ② 转发：一张**本来就指名自己**的派工单被自己再转发 ⇒ 也推出自己，但它不是回报。
+      // 所以报错要同时说清两条路，而不是武断断言"这是一份回报"——实测后端窗口转发
+      // 指名自己的派工单时，原报错把它误诊成回报，会把人引向错误的修法。
+      throw new Error(
+        `${tool}: refusing to send a message to the calling session itself ("${callerId}"). `
+        + 'The filename\'s trailing bracket resolved to YOU. That happens in two different cases, '
+        + 'so decide which applies: '
+        + '(a) you are sending your OWN REPORT — a report filename\'s bracket names who WROTE it, '
+        + 'so it resolves to you; pass "to" with the address of whoever dispatched to you. '
+        + (looksLikeReport ? reportHint(services, caller) : '')
+        + '(b) you are FORWARDING a card that names you as its recipient — then pass "to" naming '
+        + 'the session you actually intend to send it to.'
+      )
   }
 
   exec.signal?.throwIfAborted()
@@ -1262,6 +1284,19 @@ async function deliverMessage(services, exec, spec) {
     cardPath,
     targetRole: resolved.viaRole,
   })
+  // 最终把关：把**调用方提供的两部分合起来**量一次。
+  // 逐字段检查挡不住两个字段各自合法、拼起来超标（实测 8000+8000 ⇒ 收件方收到 16,753）。
+  // 但刻意**不把插件自己的样板算进去**（"[派工/消息] 来自…" 与「回信方式」块约 700 字符）：
+  // 上限描述的是调用方给多少内容，把样板计入会让"传 8000"这种原本合法的调用突然失败——
+  // 那是破坏性变更，不该顺手做。
+  const provided = text.length + cardPath.length
+  if (provided > MESSAGE_MAX_CHARS) {
+    throw new Error(
+      `${tool}: message + card_path is ${provided} characters, over the ${MESSAGE_MAX_CHARS} `
+      + 'limit (they are both delivered to the recipient). Shorten "message", or move the '
+      + 'detail into the file named by "card_path" so only its path is sent.',
+    )
+  }
   if (mode === 'steer') target.steer(message)
   else target.followup(message)
 
@@ -1429,9 +1464,15 @@ function createReceiptMessage(target, targetRole, summary) {
     role: 'user',
     content: [{
       type: 'text',
-      text: `[回执] 消息已送达${targetRole === undefined ? '' : `角色 ${JSON.stringify(targetRole)}（`}会话 ${targetId}`
-        + `${targetRole === undefined ? '' : '）'}，对方已收到并开始处理。${summary === '' ? '' : `\n摘要：${summary}`}`,
-    }],
+        // 措辞必须与**实际保证**一致：这条消息只是被放进了对方的收件队列
+        // （`followup`/`steer`），并不等于对方已经看到——DSH 在取消/销毁时可能丢弃尚未
+        // 取走的排队输入，而那种丢失本插件无从得知、发送方也收不到任何通知。
+        // 早先写"对方已收到并开始处理"，比 README 自己声明的"回执只表示已投递"还强，
+        // 会让发送方放心地不再跟踪一件其实从未执行的工作。
+        text: `[回执] 消息已投递到${targetRole === undefined ? '' : `角色 ${JSON.stringify(targetRole)}（`}会话 ${targetId}`
+          + `${targetRole === undefined ? '' : '）'}的收件队列（**不表示对方已看到**）。`
+          + `${summary === '' ? '' : `\n摘要：${summary}`}`,
+      }],
     source: {
       kind: RECEIPT_SOURCE_KIND,
       form: 'notice',

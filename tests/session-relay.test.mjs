@@ -329,6 +329,17 @@ describe('register_session_role', () => {
     assert.equal(value.selfRole, undefined)
   })
 
+  test('a corrupt registry is REPORTED by the listing tool, not silently hidden', async () => {
+    // Degrading gracefully is right (a read-only tool must not start throwing), but hiding the
+    // reason is not: the user would see "you have no role" here while registration says
+    // "file is not valid JSON", with no visible link between the two.
+    writeFileSync(rolesFile, '{ this is not json')
+    const { tools, commander } = hostWith()
+    const value = await callTool(tools, 'list_workspace_sessions', {}, { agent: commander })
+    assert.equal(value.selfRole, undefined, 'still degrades gracefully')
+    assert.match(String(value.registryError), /not valid JSON/)
+  })
+
   test('a merely EMPTY registry self-heals (nothing to lose)', async () => {
     // An empty file has no records to destroy, so overwriting it is a repair, not data loss.
     // This is the behaviour that must survive the data-loss guard above.
@@ -827,6 +838,35 @@ describe('refusals — arguments', () => {
     assert.equal(outcome.ok, false)
     assert.match(outcome.error, /8000/)
     assert.match(outcome.error, /card_path/)
+  })
+
+  test('message + card_path together may not exceed the limit', async () => {
+    // Per-field checks are not enough: each can be legal while the SUM is nearly double.
+    // Measured before the fix: 8000 + 8000 was accepted, so the recipient got a 16 753-char
+    // message against a documented 8000 limit.
+    const { tools, commander, workerAgents } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })
+    const outcome = await tryTool(
+      tools, 'send_session_message',
+      { to: '后端窗口', message: 'm'.repeat(5000), card_path: `${'c'.repeat(5000)}.md` },
+      { agent: commander },
+    )
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /message \+ card_path/)
+  })
+
+  test('an 8000-character body is still accepted (the documented boundary is unchanged)', async () => {
+    // The sum check must not silently tighten the limit: the preamble the plugin adds
+    // ("[派工/消息] 来自…" plus the reply block) is the plugin's own boilerplate and must not
+    // count against the caller's quota, or "pass 8000" would start failing.
+    const { tools, commander, workerAgents } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })
+    const outcome = await tryTool(
+      tools, 'send_session_message',
+      { to: '后端窗口', message: 'x'.repeat(8000) },
+      { agent: commander },
+    )
+    assert.equal(outcome.ok, true)
   })
 
   test('card_path is subject to the same size limit as message', async () => {
