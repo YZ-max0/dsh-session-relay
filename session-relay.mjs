@@ -68,7 +68,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 
@@ -588,9 +588,79 @@ function saveRoles(roles) {
   const file = rolesFile()
   const dir = dirname(file)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-  const tmp = `${file}.${process.pid}.tmp`
-  writeFileSync(tmp, `${JSON.stringify(roles, null, 2)}\n`, 'utf8')
-  renameSync(tmp, file)
+  // 临时名带上 pid 与随机后缀：同一进程并发写、或多进程同时写，都不会互相踩到对方的临时文件。
+  const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
+  try {
+    writeFileSync(tmp, `${JSON.stringify(roles, null, 2)}\n`, 'utf8')
+    renameSync(tmp, file)
+  } catch (error) {
+    // 写失败时清掉临时文件，别在目录里留垃圾（rename 成功则临时名已不存在）。
+    try { rmSync(tmp, { force: true }) } catch { /* 清理失败无所谓，不影响正确性 */ }
+    throw error
+  }
+}
+
+/** 锁目录的陈旧阈值：超过此时长视为上一个持有者已崩溃，允许抢占。 */
+const ROLES_LOCK_STALE_MS = 10_000
+/** 等锁的最长时间；超过就放弃（宁可报错，也不要无限阻塞模型轮次）。 */
+const ROLES_LOCK_TIMEOUT_MS = 5_000
+
+/**
+ * 用 `mkdir` 的原子性做**跨进程**互斥，执行一次"读-改-写"。
+ *
+ * 为什么需要：`register_session_role` 是 read-modify-write，而 `$DSH_HOME` 是**机器级**的
+ * ——同时开两个 profile（例如 web + headless）就是两个进程读写同一个 roles.json。
+ * 两边各读到同一份旧内容、再各写回去，**后写的会覆盖先写的**（实测：两个进程各登记
+ * 一个角色，最后只剩一个）。原子 rename 只能防"半截文件"，防不了"丢失更新"。
+ *
+ * 用目录而不是文件做锁：`mkdirSync` 在**已存在时会抛 EEXIST**，这是内核保证的原子判定，
+ * 不需要 `O_EXCL` 之外的花招，且所有平台行为一致。
+ *
+ * 崩溃自愈：锁目录里写一个时间戳；若发现锁已过期（超过 {@link ROLES_LOCK_STALE_MS}），
+ * 说明持有者已死，直接抢占——避免一个崩溃的进程把名册永久锁死。
+ *
+ * @param job - 持锁期间执行的函数；返回值原样传出。
+ * @returns `job` 的返回值。
+ * @throws 等锁超时，或 `job` 自身抛错。
+ */
+function withRolesLock(job) {
+  const lockDir = `${rolesFile()}.lock`
+  const dir = dirname(lockDir)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  const deadline = Date.now() + ROLES_LOCK_TIMEOUT_MS
+  // 同步自旋等锁：本插件的关键段极短（一次读+一次写），且工具调用本身是同步完成的，
+  // 用 `Atomics.wait` 做真正的小睡，避免空转烧 CPU。
+  const sleep = (ms) => {
+    try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch { /* 不支持就退化为忙等 */ }
+  }
+  for (;;) {
+    try {
+      mkdirSync(lockDir)
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      // 抢占陈旧的锁（持有者崩溃的情形）。
+      try {
+        const age = Date.now() - statSync(lockDir).mtimeMs
+        if (age > ROLES_LOCK_STALE_MS) {
+          rmSync(lockDir, { recursive: true, force: true })
+          continue
+        }
+      } catch { /* 锁刚好被释放了，下一轮会拿到 */ }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `timed out waiting for the role registry lock at ${lockDir}. `
+          + 'Another DSH process may be holding it; if none is running, delete that directory.',
+        )
+      }
+      sleep(25)
+    }
+  }
+  try {
+    return job()
+  } finally {
+    try { rmSync(lockDir, { recursive: true, force: true }) } catch { /* 释放失败由陈旧阈值兜底 */ }
+  }
 }
 
 /** 某个工作区（cwd）的角色表：`{ 角色名: { sessionId, description?, updatedAt } }`。 */
@@ -638,37 +708,41 @@ async function registerSessionRole(services, exec, args) {
 
   const description = typeof args?.description === 'string' ? args.description.trim() : undefined
 
-  const all = loadRoles()
-  const table = { ...(all[cwd] ?? {}) }
+  // 整个「读 → 改 → 写」都在跨进程锁内完成。若在锁外先读、只在写时加锁，两个进程仍会
+  // 各持一份旧快照，后写的覆盖先写的（丢失更新）——那正是加锁要解决的问题。
+  return withRolesLock(() => {
+    const all = loadRoles()
+    const table = { ...(all[cwd] ?? {}) }
 
-  const previousHolder = table[role]?.sessionId
-  // 一个会话只保留一个角色：先把它旧的角色释放掉，避免同一会话挂多个名字。
-  const releasedRole = (() => {
-    for (const [name, entry] of Object.entries(table)) {
-      if (entry?.sessionId === sessionId && name !== role) {
-        delete table[name]
-        return name
+    const previousHolder = table[role]?.sessionId
+    // 一个会话只保留一个角色：先把它旧的角色释放掉，避免同一会话挂多个名字。
+    const releasedRole = (() => {
+      for (const [name, entry] of Object.entries(table)) {
+        if (entry?.sessionId === sessionId && name !== role) {
+          delete table[name]
+          return name
+        }
       }
+      return undefined
+    })()
+
+    table[role] = {
+      sessionId,
+      ...description === undefined ? {} : { description },
+      updatedAt: Date.now(),
     }
-    return undefined
-  })()
+    all[cwd] = table
+    saveRoles(all)
 
-  table[role] = {
-    sessionId,
-    ...description === undefined ? {} : { description },
-    updatedAt: Date.now(),
-  }
-  all[cwd] = table
-  saveRoles(all)
-
-  return {
-    registered: true,
-    role,
-    sessionId,
-    workspace: cwd,
-    ...previousHolder !== undefined && previousHolder !== sessionId ? { previousHolder } : {},
-    ...releasedRole === undefined ? {} : { releasedRole },
-  }
+    return {
+      registered: true,
+      role,
+      sessionId,
+      workspace: cwd,
+      ...previousHolder !== undefined && previousHolder !== sessionId ? { previousHolder } : {},
+      ...releasedRole === undefined ? {} : { releasedRole },
+    }
+  })
 }
 
 /* ------------------------------------------------------------------ 发现实现 */

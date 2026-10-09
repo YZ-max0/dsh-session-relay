@@ -10,8 +10,10 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { execFile } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 
 import * as plugin from '../session-relay.mjs'
 import {
@@ -103,6 +105,35 @@ describe('plugin shape', () => {
 })
 
 describe('register_session_role', () => {
+  test('simultaneous registrations from SEPARATE PROCESSES do not lose updates', async () => {
+    // The role registry lives in $DSH_HOME and is therefore MACHINE-wide: running two
+    // profiles at once (e.g. web + headless) means two DSH processes read-modify-writing
+    // the same file. Atomic rename prevents a half-written file, but NOT a lost update:
+    // both read the same old snapshot, both write back, and the later write erases the
+    // other's role. Measured by hand before the lock: 6 concurrent registrations -> 1 role.
+    //
+    // A single-process test cannot catch this — this critical section is synchronous, so
+    // await interleaving never reproduces it. Hence real child processes.
+    const child = fileURLToPath(new URL('./register-role-child.mjs', import.meta.url))
+    const roles = ['甲窗口', '乙窗口', '丙窗口', '丁窗口', '戊窗口', '己窗口']
+    await Promise.all(roles.map((role, index) => new Promise((resolve, reject) => {
+      execFile(
+        process.execPath,
+        [child, role, `session-child-${index}`],
+        { env: { ...process.env, ROLES_FILE: rolesFile } },
+        (error) => (error === null ? resolve() : reject(error)),
+      )
+    })))
+
+    const saved = JSON.parse(readFileSync(rolesFile, 'utf8'))[WORKSPACE]
+    assert.equal(
+      Object.keys(saved).length,
+      roles.length,
+      `all ${roles.length} concurrent registrations must survive, got ${JSON.stringify(Object.keys(saved))}`,
+    )
+    assert.equal(existsSync(`${rolesFile}.lock`), false, 'the lock must be released')
+  })
+
   test('registers a role and reports it back', async () => {
     const { tools, commander } = hostWith()
     const value = await callTool(tools, 'register_session_role', { role: '指挥官助理' }, { agent: commander })
