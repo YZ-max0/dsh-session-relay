@@ -518,15 +518,65 @@ export function apply(ctx, config) {
 
 /* ------------------------------------------------------------------ 角色名册 */
 
-/** 读角色名册；缺失或损坏一律当作空名册（不阻断任何工具）。 */
+/**
+ * 读角色名册。
+ *
+ * ⚠️ 关键区分：**"文件不存在"与"文件损坏"必须分开对待。**
+ * 两者都读不出角色，但后果完全不同——
+ *   - 不存在 ⇒ 全新环境，返回空名册，随后写入是**创建**。
+ *   - 损坏   ⇒ 名册仍在磁盘上、只是这次读不出来。若也当成空名册，下一次
+ *              `register_session_role` 就会把整份名册**覆盖掉**，所有窗口的角色
+ *              一起消失，而且**没有任何提示**（实测：3 个角色一次性全丢）。
+ * 所以损坏时抛错，让写路径**拒绝覆盖**、让读路径能如实告知用户。
+ *
+ * @returns 解析后的名册对象。
+ * @throws 当文件存在但无法解析/不是对象时。
+ */
 function loadRoles() {
   const file = rolesFile()
+  if (!existsSync(file)) return {}
+  let raw
   try {
-    if (!existsSync(file)) return {}
-    const parsed = JSON.parse(readFileSync(file, 'utf8'))
-    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
-  } catch {
-    return {}
+    raw = readFileSync(file, 'utf8')
+  } catch (error) {
+    throw new Error(`cannot read the role registry at ${file}: ${error.message}`)
+  }
+  // 空文件（或只有空白）**没有任何内容可丢** ⇒ 当作空名册，让下次写入直接把它修好。
+  // 这与"损坏"不同：损坏的文件里可能存着全部角色的记录，覆盖它就是数据丢失。
+  if (raw.trim() === '') return {}
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    throw new Error(
+      `the role registry at ${file} is not valid JSON (${error.message}). `
+      + 'Refusing to treat it as empty, because the next registration would overwrite it '
+      + 'and all registered roles would be lost. Fix or delete the file, then retry.',
+    )
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(
+      `the role registry at ${file} is not a JSON object. Refusing to treat it as empty, `
+      + 'because the next registration would overwrite it and all registered roles would be lost.',
+    )
+  }
+  return parsed
+}
+
+
+/**
+ * 读角色名册，**读不出来就当作空**——只给"能优雅降级"的只读路径用。
+ *
+ * 与 {@link loadRoles} 的区别：这里不抛错。用于**列清单/查角色名**这类场景——
+ * 名册坏了顶多显示不出角色，绝不该让一个只读工具整体失败。
+ * ⛔ **绝不可用于写路径**：那正是"静默清空名册"缺陷的成因。
+ * @returns 名册对象；读不出时返回空对象，并附带失败原因供调用方提示。
+ */
+function loadRolesLenient() {
+  try {
+    return { roles: loadRoles(), error: undefined }
+  } catch (error) {
+    return { roles: {}, error: error.message }
   }
 }
 
@@ -545,7 +595,8 @@ function saveRoles(roles) {
 
 /** 某个工作区（cwd）的角色表：`{ 角色名: { sessionId, description?, updatedAt } }`。 */
 function rolesForWorkspace(cwd) {
-  const all = loadRoles()
+  // 只读路径：名册坏了顶多查不出角色，不该让整个工具失败。
+  const { roles: all } = loadRolesLenient()
   const bucket = all[cwd]
   return bucket !== null && typeof bucket === 'object' ? { ...bucket } : {}
 }
@@ -930,6 +981,14 @@ async function deliverMessage(services, exec, spec) {
     throw new Error(
       `${tool}: message is ${text.length} characters; the limit is ${MESSAGE_MAX_CHARS}. `
       + 'Hand over a long document by putting it in a file and passing "card_path" instead.',
+    )
+  }
+  // `card_path` 同样进收件方的上下文，因此必须受同一个上限约束。
+  // 早先只查了 `message`，于是 `card_path` 成了绕过上限的后门：实测传入 5 万字符的
+  // 路径会被原样接受。虽然正常路径都很短，但"限额只管一半"本身就是漏洞。
+  if (cardPath.length > MESSAGE_MAX_CHARS) {
+    throw new Error(
+      `${tool}: card_path is ${cardPath.length} characters; the limit is ${MESSAGE_MAX_CHARS}.`,
     )
   }
 

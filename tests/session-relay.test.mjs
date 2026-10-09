@@ -170,14 +170,50 @@ describe('register_session_role', () => {
     assert.match(outcome.error, /no working directory/)
   })
 
-  test('a corrupt registry degrades to empty instead of breaking every tool', async () => {
+  test('a corrupt registry must NOT be silently overwritten (data-loss guard)', async () => {
+    // The dangerous case: the file holds real role records but cannot be parsed (half-written,
+    // hand-edited badly, disk full). Treating it as "empty" means the next registration
+    // overwrites it — every window's role vanishes with no warning. Measured before the fix:
+    // 3 registered roles lost in one call. So registration must REFUSE instead.
+    const corrupt = '{"' + WORKSPACE + '":{"指挥官助理":{"sessionId":"session-a"'
+    writeFileSync(rolesFile, corrupt)
+    const { tools, commander } = hostWith()
+
+    const outcome = await tryTool(tools, 'register_session_role', { role: '新窗口' }, { agent: commander })
+    assert.equal(outcome.ok, false, 'must refuse rather than clobber a registry it cannot parse')
+    assert.match(outcome.error, /would be lost|Refusing/)
+    assert.equal(readFileSync(rolesFile, 'utf8'), corrupt, 'the unparseable file must be left untouched')
+  })
+
+  test('a corrupt registry still degrades gracefully for read-only tools', async () => {
+    // Listing must not start failing just because the registry is unreadable: "I cannot show
+    // you roles" is acceptable, "the tool throws" is not.
     writeFileSync(rolesFile, '{ this is not json')
     const { tools, commander } = hostWith()
     const value = await callTool(tools, 'list_workspace_sessions', {}, { agent: commander })
     assert.equal(value.selfRole, undefined)
-    // Registering must still repair the file rather than staying broken forever.
+  })
+
+  test('a merely EMPTY registry self-heals (nothing to lose)', async () => {
+    // An empty file has no records to destroy, so overwriting it is a repair, not data loss.
+    // This is the behaviour that must survive the data-loss guard above.
+    writeFileSync(rolesFile, '   \n')
+    const { tools, commander } = hostWith()
     await callTool(tools, 'register_session_role', { role: '指挥官助理' }, { agent: commander })
-    assert.equal(JSON.parse(readFileSync(rolesFile, 'utf8'))[WORKSPACE]['指挥官助理'].sessionId, 'session-commander')
+    assert.equal(
+      JSON.parse(readFileSync(rolesFile, 'utf8'))[WORKSPACE]['指挥官助理'].sessionId,
+      'session-commander',
+    )
+  })
+
+  test('registration recovers once a corrupt registry is repaired', async () => {
+    writeFileSync(rolesFile, '{ not json')
+    const { tools, commander } = hostWith()
+    assert.equal((await tryTool(tools, 'register_session_role', { role: '甲' }, { agent: commander })).ok, false)
+    // The user fixes the file (or deletes it); registration must work again.
+    writeFileSync(rolesFile, `${JSON.stringify({ [WORKSPACE]: {} }, null, 2)}\n`)
+    const after = await tryTool(tools, 'register_session_role', { role: '乙' }, { agent: commander })
+    assert.equal(after.ok, true)
   })
 })
 
@@ -588,6 +624,21 @@ describe('refusals — arguments', () => {
     assert.equal(outcome.ok, false)
     assert.match(outcome.error, /8000/)
     assert.match(outcome.error, /card_path/)
+  })
+
+  test('card_path is subject to the same size limit as message', async () => {
+    // card_path reaches the recipient's context too, so it must obey the same cap.
+    // Checking only `message` left card_path as a bypass: 50 000 characters sailed through.
+    const { tools, commander, workerAgents } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })
+    const outcome = await tryTool(
+      tools, 'send_session_message',
+      { to: '后端窗口', card_path: `${'y'.repeat(9000)}.md` },
+      { agent: commander },
+    )
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.error, /card_path/)
+    assert.match(outcome.error, /8000/)
   })
 
   test('refuses to run without a calling agent', async () => {
