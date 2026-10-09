@@ -9,7 +9,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
@@ -132,6 +132,26 @@ describe('register_session_role', () => {
       `all ${roles.length} concurrent registrations must survive, got ${JSON.stringify(Object.keys(saved))}`,
     )
     assert.equal(existsSync(`${rolesFile}.lock`), false, 'the lock must be released')
+  })
+
+  test('waiting for the lock does NOT block the event loop', async () => {
+    // Regression guard for a mistake I made: the first implementation waited with
+    // `Atomics.wait`, which blocks the whole event loop. In a DSH host that freezes EVERY
+    // session, not just this tool call — a 5-second stall for all of them.
+    //
+    // The lock is contended by another PROCESS, so yielding the loop here is harmless and
+    // required. Assert that timers keep firing while we wait.
+    const { tools, commander } = hostWith()
+    mkdirSync(`${rolesFile}.lock`, { recursive: true })
+    let ticks = 0
+    const timer = setInterval(() => { ticks += 1 }, 10)
+    try {
+      await tryTool(tools, 'register_session_role', { role: '甲窗口' }, { agent: commander })
+    } finally {
+      clearInterval(timer)
+      rmSync(`${rolesFile}.lock`, { recursive: true, force: true })
+    }
+    assert.ok(ticks > 20, `event loop must stay responsive while waiting (ticks=${ticks})`)
   })
 
   test('registers a role and reports it back', async () => {

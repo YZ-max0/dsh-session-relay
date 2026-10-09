@@ -620,19 +620,18 @@ const ROLES_LOCK_TIMEOUT_MS = 5_000
  * 说明持有者已死，直接抢占——避免一个崩溃的进程把名册永久锁死。
  *
  * @param job - 持锁期间执行的函数；返回值原样传出。
- * @returns `job` 的返回值。
+ * @returns `job` 的返回值的 Promise。
  * @throws 等锁超时，或 `job` 自身抛错。
  */
-function withRolesLock(job) {
+async function withRolesLock(job) {
   const lockDir = `${rolesFile()}.lock`
   const dir = dirname(lockDir)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
   const deadline = Date.now() + ROLES_LOCK_TIMEOUT_MS
-  // 同步自旋等锁：本插件的关键段极短（一次读+一次写），且工具调用本身是同步完成的，
-  // 用 `Atomics.wait` 做真正的小睡，避免空转烧 CPU。
-  const sleep = (ms) => {
-    try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch { /* 不支持就退化为忙等 */ }
-  }
+  // ⚠️ 等待必须**异步**（`await` 定时器），绝不能用 `Atomics.wait` 之类的同步小睡：
+  // 那是阻塞整个事件循环的——在一个 DSH 宿主里会连带冻住**所有**会话，而不只是这一次
+  // 工具调用。锁的争用方是另一个**进程**，本进程让出事件循环完全无害。
+  const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
   for (;;) {
     try {
       mkdirSync(lockDir)
@@ -653,11 +652,11 @@ function withRolesLock(job) {
           + 'Another DSH process may be holding it; if none is running, delete that directory.',
         )
       }
-      sleep(25)
+      await sleep(25)
     }
   }
   try {
-    return job()
+    return await job()
   } finally {
     try { rmSync(lockDir, { recursive: true, force: true }) } catch { /* 释放失败由陈旧阈值兜底 */ }
   }
@@ -710,7 +709,7 @@ async function registerSessionRole(services, exec, args) {
 
   // 整个「读 → 改 → 写」都在跨进程锁内完成。若在锁外先读、只在写时加锁，两个进程仍会
   // 各持一份旧快照，后写的覆盖先写的（丢失更新）——那正是加锁要解决的问题。
-  return withRolesLock(() => {
+  return await withRolesLock(() => {
     const all = loadRoles()
     const table = { ...(all[cwd] ?? {}) }
 
