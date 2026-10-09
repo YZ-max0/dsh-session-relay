@@ -103,8 +103,6 @@ const LIST_MAX_LIMIT = 100
 const RELAY_SOURCE_KIND = 'session-relay'
 /** 本插件写入**运行时回执**的 source.kind（与转达区分，便于日志与 UI 归因）。 */
 const RECEIPT_SOURCE_KIND = 'session-relay-receipt'
-/** 同时表达两种 form 的 kind 前缀，用于识别"这是本插件写的消息"。 */
-const OWN_KINDS = new Set([RELAY_SOURCE_KIND, RECEIPT_SOURCE_KIND])
 
 /**
  * 角色名册文件；按机器保存，按工作区（cwd）分区。
