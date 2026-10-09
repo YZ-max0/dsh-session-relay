@@ -394,7 +394,7 @@ const sendTool = {
       type: 'text',
       text: `message delivered to ${value.targetRole === undefined ? '' : `role ${JSON.stringify(value.targetRole)} (`}`
         + `session ${value.targetSessionId}) via ${value.mode}; `
-        + 'the receiving session starts now and its substantive reply, if any, will arrive later as a new message to you.',
+        + 'the receiving session starts now and its substantive reply, if any, will arrive later as a new message to you.' + receiptNote(value),
     }],
   },
 }
@@ -480,7 +480,8 @@ const dispatchTool = {
         + `session ${value.targetSessionId}) via ${value.mode}; the window starts now`
         + `${value.cardReadableFromHere === false
           ? '. NOTE: this card is not readable from your side of the filesystem — do not try to quote it, and expect the window to read it from its own side'
-          : ''}.`,
+            : ''}.`
+          + receiptNote(value),
     }],
   },
 }
@@ -1546,6 +1547,26 @@ function relayState(agent) {
   } catch {
     return { agentHops: 0 }
   }
+}
+
+/**
+ * 回执写失败时给模型的提醒文本（写成功则返回空串）。
+ *
+ * 为什么必须出现在 `render` 里：DSH **刻意**不把工具的结构化 `value` 放进持久事件
+ * （`packages/core/tools/src/index.ts`：`value` 注释为 "deliberately omitted from durable
+ * events"），模型只看得到 `render` 产出的文本。所以 `receiptWritten` 哪怕在返回值里、
+ * 在 output schema 里都有，只要 render 不提，模型就**永远不知道回执没写成功**——
+ * 而工具描述里还写着"会自动写一条回执"，于是它默认一切都好。
+ *
+ * 回执本身只是增强项（投递已经成功），所以这里用"顺带提示"的语气，不制造失败感。
+ * @param value - 工具的返回值。
+ * @returns 需要追加的提示；无需提示时为空串。
+ */
+function receiptNote(value) {
+  return value?.receiptWritten === false
+    ? ' NOTE: the automatic delivery receipt could NOT be written to your log, so you will not see '
+      + 'a "[回执]" line for this send — the message itself was delivered; just do not wait for the receipt.'
+    : ''
 }
 
 /** 取正文首行作为回执摘要。 */

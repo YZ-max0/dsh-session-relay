@@ -82,6 +82,45 @@ describe('plugin shape', () => {
     ])
   })
 
+  test('a failed delivery receipt is REPORTED to the model, not silently swallowed', () => {
+    // DSH deliberately omits a tool's structured `value` from durable events
+    // (packages/core/tools/src/index.ts: "deliberately omitted"), so the model only ever sees
+    // what `output.render` produces. `receiptWritten` was in the value and the schema but in
+    // NO render, so a failed receipt was invisible — while the tool description still promised
+    // one would be written. The model would simply wait for a receipt that never arrives.
+    const { tools, commander, workerAgents } = hostWith()
+    const worker = workerAgents[0].agent
+    assert.ok(worker)
+    // Make the receipt write fail the way a real failure would.
+    commander.inject = () => { throw new Error('simulated inject failure') }
+    return (async () => {
+      await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: worker })
+      const value = await callTool(
+        tools, 'send_session_message',
+        { to: '后端窗口', message: 'x' },
+        { agent: commander },
+      )
+      assert.equal(value.receiptWritten, false, 'the fixture must actually fail the receipt')
+      const text = tools.get('send_session_message').output.render({}, value)
+        .map(part => part.text).join('')
+      assert.match(text, /could NOT be written/, 'the model must learn the receipt is missing')
+    })()
+  })
+
+  test('a SUCCESSFUL receipt adds no noise to the rendered text', async () => {
+    const { tools, commander, workerAgents } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: workerAgents[0].agent })
+    const value = await callTool(
+      tools, 'send_session_message',
+      { to: '后端窗口', message: 'x' },
+      { agent: commander },
+    )
+    assert.equal(value.receiptWritten, true)
+    const text = tools.get('send_session_message').output.render({}, value)
+      .map(part => part.text).join('')
+    assert.ok(!/could NOT be written/.test(text), 'no spurious warning on the happy path')
+  })
+
   test('every tool declares a description, parameters and output.render', () => {
     const { tools } = hostWith()
     for (const [name, definition] of tools) {

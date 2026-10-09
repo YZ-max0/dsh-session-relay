@@ -114,6 +114,16 @@
   是回报时仍附上"谁派工给你"的具体地址。
 
 
+- **回执写失败时不再"瞒着模型"**。DSH **刻意**不把工具的结构化 `value` 放进持久事件
+  （`packages/core/tools/src/index.ts` 注明 "deliberately omitted from durable events"），
+  模型只看得到 `output.render` 的文本。而 `receiptWritten` 虽然在返回值与 output schema 里，
+  **两个 render 都没提它** ⇒ 回执没写成时模型一无所知，还照着工具描述的"会自动写回执"
+  一直等一条永远不来的回执。
+
+  修法：render 里按 `receiptWritten === false` 追加一句提示（写成功时**不加任何噪音**）。
+  `send_session_message` 与 `dispatch_card` 两处都接上。
+
+
 ### 新增
 
 - **跨会话投递**：同一工作区内的会话可以互相发送消息。基于 DSH 既有的
