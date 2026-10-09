@@ -154,6 +154,60 @@ describe('register_session_role', () => {
     assert.ok(ticks > 20, `event loop must stay responsive while waiting (ticks=${ticks})`)
   })
 
+  test('refuses a role name that would shadow a session id', async () => {
+    // `to` may be either a role name or an exact session id, so a role that LOOKS like an id
+    // lets its registrant intercept traffic addressed to the real session. Verified before the
+    // fix: registering role "session-worker-0" hijacked `to:"session-worker-0"` — the rogue
+    // session got the message, the real one got nothing. Same for "Session - Worker-0", which
+    // normalises to the same string.
+    const { tools, commander } = hostWith()
+    for (const role of ['session-worker-0', 'Session - Worker-0']) {
+      const outcome = await tryTool(tools, 'register_session_role', { role }, { agent: commander })
+      assert.equal(outcome.ok, false, `role ${JSON.stringify(role)} must be rejected`)
+      assert.match(outcome.error, /session id/)
+    }
+  })
+
+  test('an exact session id is never resolved through the role table', async () => {
+    // Defence in depth: even if such a role somehow exists (hand-edited registry), addressing
+    // a real session id must reach that session and not the role holder.
+    // Real DSH ids look like `session-<hex-uuid>`; the resolver keys on that shape.
+    const realId = 'session-1fcadc74-f416-4c72-8fe3-c7700e859b26'
+    const rogueId = 'session-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const rogue = makeAgent({ id: rogueId, cwd: WORKSPACE })
+    const real = makeAgent({ id: realId, cwd: WORKSPACE })
+    const sender = makeAgent({ id: 'session-sender', cwd: WORKSPACE })
+    const host = makeContext({ agents: [rogue, real, sender] })
+    plugin.apply(host.ctx, { rolesFile })
+    // Write the hostile entry directly, bypassing the registration guard.
+    writeFileSync(rolesFile, `${JSON.stringify({
+      [WORKSPACE]: { [realId]: { sessionId: rogueId, updatedAt: 1 } },
+    }, null, 2)}\n`)
+    const value = await callTool(
+      host.tools, 'send_session_message',
+      { to: realId, message: 'x' },
+      { agent: sender },
+    )
+    assert.equal(value.targetSessionId, realId)
+    assert.equal(messagesDeliveredTo(real).length, 1, 'the real session must receive it')
+    assert.equal(messagesDeliveredTo(rogue).length, 0, 'the role holder must not intercept it')
+  })
+
+  test('refuses prototype-key role names instead of silently losing data', async () => {
+    // `table['__proto__'] = entry` hits the inherited setter: no own property is created, so
+    // JSON.stringify drops it. Verified before the fix: the tool returned registered:true while
+    // the file became {}, AND the session's previous role was deleted by the cleanup step.
+    const { tools, commander } = hostWith()
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: commander })
+    for (const role of ['__proto__', 'constructor', 'prototype']) {
+      const outcome = await tryTool(tools, 'register_session_role', { role }, { agent: commander })
+      assert.equal(outcome.ok, false, `${role} must be rejected`)
+    }
+    // The earlier registration must survive the attempts.
+    const stored = JSON.parse(readFileSync(rolesFile, 'utf8'))[WORKSPACE]
+    assert.equal(stored['后端窗口'].sessionId, 'session-commander')
+  })
+
   test('registers a role and reports it back', async () => {
     const { tools, commander } = hostWith()
     const value = await callTool(tools, 'register_session_role', { role: '指挥官助理' }, { agent: commander })
@@ -461,11 +515,32 @@ describe('runaway protection', () => {
     data: { source: { kind: 'session-relay', form: 'relay', senderSessionId: sender } },
   })
 
-  /** One locally-written receipt (never delivered, so it must not count). */
-  const localReceipt = () => ({
+  /**
+   * One locally-written receipt: proof that WE delivered something to `target`.
+   *
+   * Receipts are written into the sender's own log, so they are the guard's only evidence
+   * of OUTBOUND traffic (see `relayState`). The target matters — a receipt naming no peer
+   * counts as nothing.
+   */
+  const localReceipt = (target) => ({
     type: 'user/message',
-    data: { source: { kind: 'session-relay-receipt', form: 'notice' } },
+    data: {
+      source: {
+        kind: 'session-relay-receipt',
+        form: 'notice',
+        ...target === undefined ? {} : { targetSessionId: target },
+      },
+    },
   })
+
+  /**
+   * A complete round-trip with one peer: one message in, one message out.
+   *
+   * The guard counts `min(inbound, outbound)` per peer, because only a real back-and-forth
+   * can run away. Inbound alone models a *receiver* being fanned out to — which must NEVER
+   * be throttled (dispatching 16 cards to one window used to silence its reports entirely).
+   */
+  const roundTrip = (peer = 'session-peer') => [receivedRelay(peer), localReceipt(peer)]
 
   /**
    * A sender whose log carries `count` received relays, plus any trailing events.
@@ -476,7 +551,8 @@ describe('runaway protection', () => {
    */
   function senderWithHops(count, trailing = [], sender = 'session-peer') {
     const events = []
-    for (let index = 0; index < count; index += 1) events.push(receivedRelay(sender))
+    // `count` full round-trips: the only shape that can actually run away.
+    for (let index = 0; index < count; index += 1) events.push(...roundTrip(sender))
     events.push(...trailing)
     return makeAgent({ id: 'session-sender', cwd: WORKSPACE, events })
   }
@@ -549,6 +625,52 @@ describe('runaway protection', () => {
       { agent: busy },
     )
     assert.equal(outcome.ok, true, 'hearing from many distinct windows must not silence the coordinator')
+  })
+
+  test('a fanned-out receiver can still report back (20 cards from ONE sender)', async () => {
+    // The sharpest form of the bug above: not many senders, but ONE sender sending many cards
+    // to ONE window. That window's inbound count grows by one per card, so a naive
+    // "count inbound" guard silences it — even though it has never sent anything.
+    //
+    // Verified before the fix: 16 cards -> the worker's report was REJECTED; with 20 cards it
+    // was muted for every target until a human spoke in that session. That is this plugin's
+    // whole purpose (派工 → 回报) being blocked by its own safety net.
+    const { tools, commander, workerAgents } = hostWith()
+    const worker = workerAgents[0].agent
+    await callTool(tools, 'register_session_role', { role: '指挥官助理' }, { agent: commander })
+    await callTool(tools, 'register_session_role', { role: '后端窗口' }, { agent: worker })
+    for (let index = 1; index <= 20; index += 1) {
+      await callTool(
+        tools, 'dispatch_card',
+        { card_path: `cards/派工单-${index}（后端窗口）.md` },
+        { agent: commander },
+      )
+    }
+    const report = await tryTool(
+      tools, 'send_session_message',
+      { to: '指挥官助理', message: '回报：全部完成' },
+      { agent: worker },
+    )
+    assert.equal(report.ok, true, 'a window that only ever RECEIVED must still be able to report')
+  })
+
+  test('twenty completed round-trips with one peer are still blocked', async () => {
+    // Guard against "fixed it by removing the safety net". A genuine back-and-forth must stop.
+    const { tools, workerAgents } = hostWith()
+    const worker = workerAgents[0].agent
+    const events = []
+    for (let hop = 0; hop < 20; hop += 1) events.push(...roundTrip('session-worker-0'))
+    const busy = makeAgent({ id: 'session-busy', cwd: WORKSPACE, events })
+    const host = makeContext({ agents: [busy, worker] })
+    plugin.apply(host.ctx, { rolesFile })
+    await callTool(host.tools, 'register_session_role', { role: '甲窗口' }, { agent: busy })
+    await callTool(host.tools, 'register_session_role', { role: '乙窗口' }, { agent: worker })
+    const outcome = await tryTool(
+      host.tools, 'send_session_message',
+      { to: '乙窗口', message: 'x' },
+      { agent: busy },
+    )
+    assert.equal(outcome.ok, false, 'twenty completed round-trips must be blocked')
   })
 
   test('a ping-pong with ONE peer still trips the guard', async () => {

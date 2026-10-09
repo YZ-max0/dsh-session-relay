@@ -130,26 +130,28 @@ function rolesFile() {
 }
 
 /**
- * 无人介入时，允许**与同一个对端**往复的转达消息条数上限。
+ * 无人介入时，允许**与同一个对端**完成的「往返」次数上限。
  *
  * ── 为什么要防 ──────────────────────────────────────────────────────────
  * "发完即自动开跑"意味着两个 AI 会话可以互相唤醒、**在无人看着的情况下持续烧 token**——
  * 一句「好的」被回一句「收到」就能无限循环。
  *
- * ── 为什么不能按"总深度/总条数"算 ───────────────────────────────────────
- * 本工作流里有两类**正常**的集中通信，按总数计都会误伤：
- *   ① 单方广播：指挥连派 N 张卡（自己日志里 0 条转达）
+ * ── 为什么"收到多少条"不能当判据 ────────────────────────────────────────
+ * 本工作流有三类**正常**的集中通信，按"收到量"计都会误伤（前两类已修，第三类最难发现）：
+ *   ① 单方广播：指挥连派 N 张卡（自己的日志里 0 条转达）
  *   ② 扇形汇聚：N 个窗口各回报一次（每条来自**不同**会话，没有往复）
- * 实测教训：一个 4 窗口的验证累计 14 条入站转达、正在逼近上限，而其中**没有任何环路**；
- * 按总数计会让协调方"连续听到 16 个窗口说话"就被禁言——**连回一句「收到」都做不到**，
- * 必须等真人开口才解封。
+ *   ③ 🔴 **连派 N 张卡给同一个窗口**：该窗口"收到"N 条来自同一发送方的转达，
+ *      按收到量计它就被禁言——**而它只是收，从未回过**。实测连派 16 张卡后，
+ *      该窗口的回报被拒；派 20 张时它对任何目标都发不出话，直到真人在它那里说话。
+ *      这恰好把本插件存在的意义（派工 → 回报）拦死了。
  *
- * ── 采用的判据 ──────────────────────────────────────────────────────────
- * **自最近一条真人消息以来，与【同一个发送方】往复的条数**（取各发送方中的最大值）。
+ * ── 采用的判据：数「往返」，而不是数「收到」 ────────────────────────────
+ * 对每个对端取 `min(我收到它几条, 我发给它几条)`，再取各对端的最大值。
  *   - 真人一次输入 ⇒ 重置预算
- *   - 本地写的回执 ⇒ 不计（它不发给任何人）
- *   - 扇形汇聚 ⇒ 每方各计各的，互不累加
- *   - 真正的 A↔B 乒乓 ⇒ 同一方持续累加 ⇒ 有限步内被掐断
+ *   - 本地写的**回执** ⇒ 提供"我发给了谁"的证据（回执写在发送方自己的日志里）
+ *   - 只收不发（②③）⇒ `min(...) = 0` ⇒ **永不被拦**
+ *   - 只发不收（①）⇒ 同上
+ *   - 真正的 A↔B 乒乓 ⇒ 收与发同步增长 ⇒ 有限步内被掐断
  *
  * 上限取 16：足够覆盖一个卡周期内的多次往返，又远小于失控循环的规模。
  */
@@ -200,6 +202,7 @@ export function targetRoleFromCardPath(filePath) {
   if (/[\u0000-\u001f\u007f]/.test(head)) return undefined
   return head
 }
+
 
 /**
  * 一个候选目标与某角色的匹配强度。**只做精确或"去空白/全半角"级的归一化比较**，
@@ -704,6 +707,24 @@ async function registerSessionRole(services, exec, args) {
   // 角色名会被拼进提示文本，禁止控制字符以免破坏收件方的消息结构。
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(role)) throw new Error(`${TOOL_REGISTER}: role must not contain control characters`)
+  // 拒绝"看起来像会话 id"的角色名：寻址时 `to` 既可能是角色名、也可能是精确 session id，
+  // 若允许角色名长得像 id，就会**遮蔽**别人——实测登记角色 "session-worker-0" 后，
+  // 发给 `session-worker-0` 的消息会被劫持到登记者那里，真正的那个会话一条都收不到。
+  // 从源头禁止，比在解析时猜更安全，也更容易向用户解释。
+  // 用**与寻址相同的归一化**来判断（去空白 + 小写），否则 "Session - Worker-0" 这种写法
+  // 能绕过检查，却在 `sameRole` 里归一化成同一个串，照样遮蔽别人的 id。
+  if (/^session-/.test(role.replace(/\s+/g, '').toLocaleLowerCase())) {
+    throw new Error(
+      `${TOOL_REGISTER}: role must not look like a session id (after removing spaces it starts `
+      + 'with "session-"). Pick a human-readable window name instead, so addressing cannot be shadowed.',
+    )
+  }
+  // `__proto__` 之类的原型键名：`table[role] = …` 会命中继承来的 setter，既不写入 own 属性、
+  // 又让 JSON 少一个键 ⇒ 工具返回"登记成功"但文件里什么都没有（实测还会连带把该会话的
+  // 旧角色删掉）。直接拒绝。
+  if (role === '__proto__' || role === 'constructor' || role === 'prototype') {
+    throw new Error(`${TOOL_REGISTER}: role must not be a JavaScript prototype key name ("${role}")`)
+  }
 
   const description = typeof args?.description === 'string' ? args.description.trim() : undefined
 
@@ -1238,6 +1259,13 @@ function looksLikeSessionId(value) {
  * @returns 目标 session id 与（若按角色命中）命中的角色名。
  */
 function resolveTarget(services, cwd, to) {
+  // 形如 session id 的 `to` 一律**当字面 id 处理，不查角色表**。
+  //
+  // 否则角色名可以遮蔽别人的 id：实测登记一个叫 "session-worker-0" 的角色后，
+  // `send_session_message({to:"session-worker-0"})` 会被投给登记者，真正的会话一条都收不到。
+  // 归一化匹配尤其危险——"Session - Worker-0" 去掉空白并小写后也是 "session-worker-0"。
+  // （注册侧同样禁止这类角色名，见 registerSessionRole；两处一起才既安全又好解释。）
+  if (looksLikeSessionId(to)) return { sessionId: to }
   if (cwd !== undefined) {
     const table = rolesForWorkspace(cwd)
     const exact = table[to]
@@ -1387,23 +1415,40 @@ function createReceiptMessage(target, targetRole, summary) {
 function relayState(agent) {
   try {
     const events = agent?.session?.snapshotEvents?.() ?? []
-    /** 自最近真人消息起，每个发送方各发来多少条。 */
-    const perSender = new Map()
+    /** 自最近真人消息起，每个对端各发来多少条。 */
+    const inbound = new Map()
+    /** 自最近真人消息起，我各发给每个对端多少条（由本地回执反查）。 */
+    const outbound = new Map()
     for (let index = events.length - 1; index >= 0; index--) {
       const event = events[index]
       if (event?.type !== 'user/message') continue
       const source = event.data?.source
       const kind = source?.kind
       if (kind === 'user') break // 真人输入：预算到此重置。
-      if (kind !== RELAY_SOURCE_KIND) continue
-      // 认不出发送方时退化成一个共享桶，仍能被计数（宁可保守，也不要漏计）。
-      const sender = typeof source.senderSessionId === 'string' && source.senderSessionId !== ''
-        ? source.senderSessionId
-        : '<unknown>'
-      perSender.set(sender, (perSender.get(sender) ?? 0) + 1)
+      if (kind === RELAY_SOURCE_KIND) {
+        // 认不出发送方时退化成一个共享桶，仍能被计数（宁可保守，也不要漏计）。
+        const sender = typeof source.senderSessionId === 'string' && source.senderSessionId !== ''
+          ? source.senderSessionId
+          : '<unknown>'
+        inbound.set(sender, (inbound.get(sender) ?? 0) + 1)
+      } else if (kind === RECEIPT_SOURCE_KIND) {
+        // 回执是**我自己**的投递记录（写在发送方自己的日志里），因此它是"我发给了谁"的
+        // 可靠来源，且不依赖任何外部状态。
+        const peer = typeof source.targetSessionId === 'string' ? source.targetSessionId : undefined
+        if (peer !== undefined) outbound.set(peer, (outbound.get(peer) ?? 0) + 1)
+      }
     }
+    // ⚠️ 只数"收到"是不够的——那会误伤**最正常的扇出**：指挥连派 N 张卡给**同一个**窗口时，
+    // 该窗口自己就"收到"了 N 条来自同一发送方的转达，于是它**再也无法回报**
+    // （实测：派 16 张卡 ⇒ 该窗口被禁言，而这正是本插件存在的意义）。
+    //
+    // 真正的失控环路必然是**往复**：收到它一条、又回它一条，如此反复。
+    // 所以取 `min(收到, 发出)`——"只收不发"的收件方永不被拦，乒乓循环仍会在有限步内被掐断。
     let agentHops = 0
-    for (const count of perSender.values()) agentHops = Math.max(agentHops, count)
+    for (const [peer, received] of inbound) {
+      const sent = outbound.get(peer) ?? 0
+      agentHops = Math.max(agentHops, Math.min(received, sent))
+    }
     return { agentHops }
   } catch {
     return { agentHops: 0 }
