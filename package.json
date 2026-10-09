@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-relay",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "驿传 — Cross-session messaging for DSH: dispatch task cards to other sessions in the same workspace and get reports back, with stable role addressing, automatic delivery receipts and runaway-loop protection.",
   "keywords": [
     "dsh",

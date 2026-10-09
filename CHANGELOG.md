@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-10-09
+
+修复一轮独立代码审计发现的缺陷（3 高 + 5 中 + 2 低），以及我自己在修复过程中引入的 1 个问题。
+全部缺陷均先复现、后修复，并为每条补了回归测试（新增测试都用变异测试确认能抓住回归）。
+
 ### 修复
 
 - 🔴 **角色名册损坏时会被静默覆盖，导致所有角色丢失**（严重）。
@@ -31,10 +36,6 @@
   上下文 ⇒ 实测传入 5 万字符的路径会被原样接受，成为绕过上限的后门。
   已在共享的投递路径上对两者同时施加该上限。
 
-## [0.1.0] — 2026-10-09
-
-首个可用版本。中文名 **驿传**。
-
 - 🔴 **两个 DSH 进程同时登记角色会「丢失更新」**。
   `$DSH_HOME` 是**机器级**的——同时开两个 profile（例如 web + headless）就是两个进程
   读写同一个 `roles.json`。`register_session_role` 是 read-modify-write：两边各读到同一份
@@ -56,7 +57,6 @@
   把所有会话一起冻住最多 5 秒，而不只是这一次工具调用。已改为 `await` 定时器，
   并补一条回归测试：持锁期间断言定时器仍在触发（同步等待下 ticks=0）。
   变异测试确认该测试能抓住回归。
-
 
 - 🔴 **连派多张卡给同一个窗口 ⇒ 该窗口再也无法回报**（严重，且是本插件的主用途）。
   失控保护原先按"与同一发送方的**收到**条数"计。但收件方每收到一张卡就 +1——
@@ -84,7 +84,6 @@
   而工具却返回 `registered:true` 且伴随 `releasedRole`（清理步骤把旧角色删了）。
   实测：原有「后端窗口」被删、文件变成 `{}`。已拒绝 `__proto__` / `constructor` / `prototype`。
 
-
 - **角色名册的锁：自愈自相矛盾，且会误抢活持有者**。
   两处都改：
   ① 原 `STALE(10s) > TIMEOUT(5s)` ⇒ 等待方在自己的时限内**永远等不到**锁变陈旧，
@@ -93,7 +92,6 @@
      误判成崩溃，删掉它的锁 ⇒ 两进程同时进临界段，丢失更新又回来了。
      改为**优先看持有者 pid 是否还活着**（锁内记 pid，`kill(pid,0)` 得 ESRCH 才算崩溃），
      读不到 pid 时才退回 mtime 判断。
-
 
 - **名册损坏时，只读路径不再"沉默地装作没角色"**。`list_workspace_sessions` 现在会在
   结果里带一个 `registryError` 字段说明原因。此前它只显示"你没有角色"，而登记却报
@@ -113,7 +111,6 @@
   推出自己，但成因完全不同。报错现在并列说明两种情况（回报 / 转发）并各自给出修法；
   是回报时仍附上"谁派工给你"的具体地址。
 
-
 - **回执写失败时不再"瞒着模型"**。DSH **刻意**不把工具的结构化 `value` 放进持久事件
   （`packages/core/tools/src/index.ts` 注明 "deliberately omitted from durable events"），
   模型只看得到 `output.render` 的文本。而 `receiptWritten` 虽然在返回值与 output schema 里，
@@ -123,6 +120,9 @@
   修法：render 里按 `receiptWritten === false` 追加一句提示（写成功时**不加任何噪音**）。
   `send_session_message` 与 `dispatch_card` 两处都接上。
 
+## [0.1.0] — 2026-10-09
+
+首个可用版本。中文名 **驿传**。
 
 ### 新增
 
@@ -265,6 +265,6 @@
   排查此类问题的判据：**看运行时的实际输出**（新版文案/字段），而不是看磁盘文件——
   磁盘是最新的，进程里的是旧的。
 
-
-[Unreleased]: https://github.com/YZ-max0/dsh-session-relay/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/YZ-max0/dsh-session-relay/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/YZ-max0/dsh-session-relay/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/YZ-max0/dsh-session-relay/releases/tag/v0.1.0
